@@ -1,0 +1,70 @@
+{
+  "name": "pmtiles-torrent",
+  "version": "0.1.0",
+  "description": "Serve a PMTiles archive from a BitTorrent swarm — a torrent-backed Source for the pmtiles package",
+  "type": "module",
+  "main": "dist/cjs/index.cjs",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.cts",
+        "default": "./dist/cjs/index.cjs"
+      }
+    },
+    "./webtorrent": {
+      "import": {
+        "types": "./dist/esm/webtorrent.d.ts",
+        "default": "./dist/esm/webtorrent.js"
+      },
+      "require": {
+        "types": "./dist/cjs/webtorrent.d.cts",
+        "default": "./dist/cjs/webtorrent.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "tsx --test test/*.test.ts",
+    "tsc": "tsc --noEmit",
+    "prepublishOnly": "npm run tsc && npm test && npm run build"
+  },
+  "keywords": [
+    "pmtiles",
+    "bittorrent",
+    "webtorrent",
+    "torrent",
+    "map",
+    "tiles",
+    "maplibre",
+    "p2p"
+  ],
+  "license": "BSD-3-Clause",
+  "peerDependencies": {
+    "pmtiles": ">=3",
+    "webtorrent": ">=2"
+  },
+  "peerDependenciesMeta": {
+    "webtorrent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.26",
+    "pmtiles": "^4.4.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.0.0"
+  }
+}
