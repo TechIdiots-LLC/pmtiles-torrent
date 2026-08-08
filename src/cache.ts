@@ -8,60 +8,44 @@
  * engine.
  */
 export class PieceCache {
-  #maxBytes;
+  #maxBytes: number;
   #bytes = 0;
   // Map preserves insertion order, so the first key is always the LRU entry.
-  #entries = new Map();
+  #entries = new Map<number, Uint8Array>();
 
   /**
-   * Creates a piece cache.
-   * @param {number} maxBytes - Byte budget. Zero disables caching entirely.
+   * @param maxBytes Byte budget. Zero disables caching entirely.
    */
-  constructor(maxBytes) {
+  constructor(maxBytes: number) {
     this.#maxBytes = Math.max(0, maxBytes);
   }
 
-  /**
-   * Total bytes currently held.
-   * @returns {number} - Resident byte count.
-   */
-  get byteLength() {
+  /** Total bytes currently held. */
+  get byteLength(): number {
     return this.#bytes;
   }
 
-  /**
-   * Current byte budget.
-   * @returns {number} - The configured maximum.
-   */
-  get maxBytes() {
+  /** Current byte budget. */
+  get maxBytes(): number {
     return this.#maxBytes;
   }
 
-  /**
-   * Number of pieces currently held.
-   * @returns {number} - Resident piece count.
-   */
-  get size() {
+  /** Number of pieces currently held. */
+  get size(): number {
     return this.#entries.size;
   }
 
   /**
    * Changes the budget, evicting as needed. Used once torrent metadata arrives
    * and the real piece length is known.
-   * @param {number} maxBytes - The new byte budget.
-   * @returns {void}
    */
-  resize(maxBytes) {
+  resize(maxBytes: number): void {
     this.#maxBytes = Math.max(0, maxBytes);
     this.#evict();
   }
 
-  /**
-   * Looks up a piece, marking it most recently used.
-   * @param {number} index - Piece index.
-   * @returns {Uint8Array | undefined} - The piece, or undefined if not cached.
-   */
-  get(index) {
+  /** Looks up a piece, marking it most recently used. */
+  get(index: number): Uint8Array | undefined {
     const hit = this.#entries.get(index);
     if (hit === undefined) return undefined;
     // Re-insert to mark as most recently used.
@@ -70,13 +54,8 @@ export class PieceCache {
     return hit;
   }
 
-  /**
-   * Stores a piece, evicting the least recently used entries if over budget.
-   * @param {number} index - Piece index.
-   * @param {Uint8Array} piece - The piece contents.
-   * @returns {void}
-   */
-  set(index, piece) {
+  /** Stores a piece, evicting the least recently used entries if over budget. */
+  set(index: number, piece: Uint8Array): void {
     if (this.#maxBytes === 0) return;
     // A single piece larger than the whole budget would evict everything and
     // then itself; skip it rather than thrash.
@@ -93,20 +72,14 @@ export class PieceCache {
     this.#evict();
   }
 
-  /**
-   * Drops every cached piece.
-   * @returns {void}
-   */
-  clear() {
+  /** Drops every cached piece. */
+  clear(): void {
     this.#entries.clear();
     this.#bytes = 0;
   }
 
-  /**
-   * Evicts least recently used entries until within budget.
-   * @returns {void}
-   */
-  #evict() {
+  /** Evicts least recently used entries until within budget. */
+  #evict(): void {
     while (this.#bytes > this.#maxBytes) {
       const oldest = this.#entries.keys().next();
       if (oldest.done) break;

@@ -19,7 +19,9 @@ jobs:
           node-version: ${{ matrix.node }}
           check-latest: true
       - run: npm ci --prefer-offline --no-audit
+      - run: npm run tsc
       - run: npm test
+      - run: npm run build
 
   sidecar:
     name: libtorrent sidecar

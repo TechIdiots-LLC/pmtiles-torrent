@@ -11,7 +11,7 @@ import { FakeEngine, ramp } from './fake-engine.js';
  * @param {object} response - A PMTiles RangeResponse.
  * @returns {Uint8Array} - The data.
  */
-const bytesOf = (response) => new Uint8Array(response.data);
+const bytesOf = (response: { data: ArrayBuffer }) => new Uint8Array(response.data);
 
 describe('TorrentSource range assembly', () => {
   it('stitches a range that spans several pieces', async () => {
@@ -77,7 +77,7 @@ describe('TorrentSource range assembly', () => {
     // The last piece is clipped by the file's end, not the torrent's.
     const tail = bytesOf(await source.getBytes(950, 50));
     assert.deepStrictEqual(tail, data.slice(950, 1000));
-    const last = engine.reads.at(-1);
+    const last = engine.reads.at(-1)!;
     assert.strictEqual(last.offset + last.length, 1000);
   });
 
@@ -231,7 +231,7 @@ describe('TorrentSource cancellation', () => {
     await new Promise((resolve) => setImmediate(resolve));
     controller.abort();
 
-    await assert.rejects(pending, (error) => error.name === 'AbortError');
+    await assert.rejects(pending, (error: Error) => error.name === 'AbortError');
     assert.strictEqual(engine.aborted, 1);
     assert.strictEqual(source.stats.cancelled, 1);
   });
@@ -250,7 +250,7 @@ describe('TorrentSource cancellation', () => {
     assert.strictEqual(engine.reads.length, 1);
 
     controller.abort();
-    await assert.rejects(abandoned, (error) => error.name === 'AbortError');
+    await assert.rejects(abandoned, (error: Error) => error.name === 'AbortError');
 
     // The underlying read was never cancelled, so the second caller still wins.
     assert.strictEqual(engine.aborted, 0);
@@ -264,11 +264,17 @@ describe('TorrentSource cancellation', () => {
 
     await assert.rejects(
       source.getBytes(0, 10, AbortSignal.abort()),
-      (error) => error.name === 'AbortError',
+      (error: Error) => error.name === 'AbortError',
     );
     assert.strictEqual(engine.reads.length, 0);
   });
 });
+
+interface LeafSections {
+  root: [number, number];
+  metadata: [number, number];
+  leaf: [number, number];
+}
 
 describe('directory prefetch', () => {
   /**
@@ -276,7 +282,7 @@ describe('directory prefetch', () => {
    * @param {object} sections - Root, metadata and leaf offset/length pairs.
    * @returns {Uint8Array} - A 127-byte header.
    */
-  function header(sections) {
+  function header(sections: LeafSections) {
     const bytes = new Uint8Array(127);
     bytes.set(new TextEncoder().encode('PMTiles'), 0);
     bytes[7] = 3;
@@ -287,7 +293,7 @@ describe('directory prefetch', () => {
      * @param {number} value - Value to write.
      * @returns {void}
      */
-    const put = (offset, value) => {
+    const put = (offset: number, value: number) => {
       view.setUint32(offset, value >>> 0, true);
       view.setUint32(offset + 4, Math.floor(value / 2 ** 32), true);
     };
@@ -306,7 +312,7 @@ describe('directory prefetch', () => {
    * @param {number} length - Total archive length.
    * @returns {Uint8Array} - The archive bytes.
    */
-  function archive(sections, length) {
+  function archive(sections: LeafSections, length: number) {
     const data = ramp(length);
     data.set(header(sections), 0);
     return data;
@@ -465,7 +471,7 @@ describe('idle hydration', () => {
    * @param {number} total - Archive length.
    * @returns {Uint8Array} - The archive bytes.
    */
-  function archiveWithLeaf(leafOffset, leafLength, total) {
+  function archiveWithLeaf(leafOffset: number, leafLength: number, total: number) {
     const data = ramp(total);
     data.set(new TextEncoder().encode('PMTiles'), 0);
     data[7] = 3;
@@ -476,7 +482,7 @@ describe('idle hydration', () => {
      * @param {number} value - Value to write.
      * @returns {void}
      */
-    const put = (at, value) => {
+    const put = (at: number, value: number) => {
       view.setUint32(at, value >>> 0, true);
       view.setUint32(at + 4, Math.floor(value / 2 ** 32), true);
     };
@@ -489,7 +495,7 @@ describe('idle hydration', () => {
     return data;
   }
 
-  const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const settle = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
   it('does not hydrate leaf directories eagerly', async () => {
     const engine = new FakeEngine(archiveWithLeaf(1000, 500, 2000), {

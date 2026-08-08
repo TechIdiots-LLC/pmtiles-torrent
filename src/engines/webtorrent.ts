@@ -1,80 +1,135 @@
+import type {
+  Priority,
+  ReadRangeOptions,
+  TorrentEngine,
+  TorrentInfo,
+} from "../types.js";
+
 /**
- * A TorrentEngine backed by WebTorrent.
+ * Structural types for the small slice of WebTorrent's API we use. Declaring
+ * them here keeps `@types/webtorrent` out of the dependency tree and means this
+ * adapter compiles whether or not `webtorrent` is installed.
  *
- * Written against WebTorrent's public API (MIT, Copyright (c) Feross
+ * These describe the public API of WebTorrent (MIT, Copyright (c) Feross
  * Aboukhadijeh and WebTorrent, LLC — https://github.com/webtorrent/webtorrent).
  * No WebTorrent implementation code is copied here. See NOTICE.md.
  */
+interface WtFile {
+  name: string;
+  path: string;
+  length: number;
+  offset: number;
+  [Symbol.asyncIterator](opts?: {
+    start?: number;
+    end?: number;
+  }): AsyncIterator<Uint8Array> & { return?(): Promise<unknown> };
+}
 
-/**
- * Options for the WebTorrent engine.
- * @typedef {object} WebTorrentEngineOptions
- * @property {object | (() => object | Promise<object>)} [client] - Reuse an existing WebTorrent client, or a factory called on first read. Strongly recommended when serving more than one archive: one client means one peer pool, one port, one DHT node. When supplied, destroy() removes only this torrent and leaves the client running.
- * @property {object} [clientOptions] - Options passed to new WebTorrent() when this engine creates the client.
- * @property {string} [path] - Download path for the chunk store. Persist this to keep seeding across restarts.
- * @property {string[]} [announce] - Extra tracker announce URLs.
- * @property {string} [filePath] - Select a specific file in a multi-file torrent by its path. Without it the engine picks the largest .pmtiles file, falling back to the largest file.
- * @property {number} [readyTimeoutMs] - How long to wait for torrent metadata. Default 60s.
- * @property {number} [maxWebConns] - Simultaneous connections per web seed. WebTorrent defaults to 4; raise it when the torrent carries a BEP 19 url-list, since a web seed is usually far faster and more available than the swarm.
- * @property {string} [resumePath] - Directory for resume data. WebTorrent otherwise re-hashes the entire store on every start to rebuild its bitfield, which on a 72 GiB archive costs about a minute and scales with size. Saving the bitfield reduces that to milliseconds.
- * @property {number} [resumeIntervalMs] - How often to persist resume data while running. Default 60s.
- */
+interface WtTorrent {
+  infoHash: string;
+  name: string;
+  pieceLength: number;
+  lastPieceLength: number;
+  pieces: unknown[];
+  files: WtFile[];
+  path: string;
+  ready: boolean;
+  destroyed: boolean;
+  bitfield?: { buffer: Uint8Array };
+  select(start: number, end: number, priority?: number): void;
+  deselect(start: number, end: number): void;
+  critical(start: number, end: number): void;
+  destroy(opts?: Record<string, unknown>): void;
+  on(event: string, handler: (...args: unknown[]) => void): void;
+  once(event: string, handler: (...args: unknown[]) => void): void;
+  removeListener(event: string, handler: (...args: unknown[]) => void): void;
+}
 
-/** @type {Record<import('../types.js').Priority, number>} */
-const PRIORITY_VALUES = {
+interface WtClient {
+  add(
+    torrentId: unknown,
+    opts?: Record<string, unknown>,
+    ontorrent?: (torrent: WtTorrent) => void,
+  ): WtTorrent;
+  destroy(cb?: (err?: Error) => void): void;
+}
+
+export interface WebTorrentEngineOptions {
+  /**
+   * Reuse an existing WebTorrent client. Strongly recommended when serving more
+   * than one archive: one client means one peer pool, one port, one DHT node.
+   * When supplied, `destroy()` removes only this torrent and leaves the client
+   * running.
+   *
+   * May be a factory, called on first read, so a host application can share one
+   * client without constructing it until an archive actually needs it.
+   */
+  client?: WtClient | (() => WtClient | Promise<WtClient>);
+  /** Options passed to `new WebTorrent()` when this engine creates the client. */
+  clientOptions?: Record<string, unknown>;
+  /** Download path for the chunk store. Persist this to keep seeding across restarts. */
+  path?: string;
+  /** Extra tracker announce URLs. */
+  announce?: string[];
+  /**
+   * Select a specific file in a multi-file torrent by its path. Without it the
+   * engine picks the largest `.pmtiles` file, falling back to the largest file.
+   */
+  filePath?: string;
+  /** How long to wait for torrent metadata. Default 60s. */
+  readyTimeoutMs?: number;
+  /**
+   * Directory for resume data. WebTorrent otherwise re-hashes the entire store
+   * on every start to rebuild its bitfield, which on a 72 GiB archive costs
+   * about a minute and scales with size. Saving the bitfield reduces that to
+   * milliseconds.
+   */
+  resumePath?: string;
+  /** How often to persist resume data while running. Default 60s. */
+  resumeIntervalMs?: number;
+  /**
+   * Simultaneous connections per web seed. WebTorrent defaults to 4; raise it
+   * when the torrent carries a BEP 19 url-list, since a web seed is usually far
+   * faster and more available than the swarm.
+   */
+  maxWebConns?: number;
+}
+
+const PRIORITY_VALUES: Record<Priority, number> = {
   critical: 10,
   high: 5,
   normal: 0,
 };
 
-/**
- * Builds an AbortError.
- * @returns {Error} - An error whose name is AbortError.
- */
-function abortError() {
-  const error = new Error('The operation was aborted.');
-  error.name = 'AbortError';
+function abortError(): Error {
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
   return error;
 }
 
-/**
- * Rejects as soon as a signal aborts, rather than waiting for the promise.
- * @template T
- * @param {Promise<T>} promise - The promise to race.
- * @param {AbortSignal} [signal] - The signal to watch.
- * @returns {Promise<T>} - The promise result, or a rejection on abort.
- */
-function raceAbort(promise, signal) {
+/** Rejects as soon as a signal aborts, rather than waiting for the promise. */
+function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(abortError());
-  return new Promise((resolve, reject) => {
-    /**
-     * Rejects the race.
-     * @returns {void}
-     */
+  return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(abortError());
-    signal.addEventListener('abort', onAbort, { once: true });
+    signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => {
-        signal.removeEventListener('abort', onAbort);
+        signal.removeEventListener("abort", onAbort);
         resolve(value);
       },
       (error) => {
-        signal.removeEventListener('abort', onAbort);
+        signal.removeEventListener("abort", onAbort);
         reject(error);
       },
     );
   });
 }
 
-/**
- * Pulls an infohash out of a magnet URI so getKey() works before metadata
- * arrives.
- * @param {unknown} torrentId - Magnet URI, infohash, or anything else.
- * @returns {string} - A stable key.
- */
-function deriveKey(torrentId) {
-  if (typeof torrentId !== 'string') return 'torrent:unknown';
+/** Pull an infohash out of a magnet URI so `getKey()` works before metadata. */
+function deriveKey(torrentId: unknown): string {
+  if (typeof torrentId !== "string") return "torrent:unknown";
   const magnet = /xt=urn:bt[im]h:([a-z0-9]+)/i.exec(torrentId);
   if (magnet) return `torrent:${magnet[1].toLowerCase()}`;
   if (/^[a-f0-9]{40}$/i.test(torrentId)) {
@@ -83,14 +138,9 @@ function deriveKey(torrentId) {
   return `torrent:${torrentId}`;
 }
 
-/**
- * Chooses which file in the torrent is the PMTiles archive.
- * @param {object} torrent - The WebTorrent torrent.
- * @param {string} [filePath] - Explicit path or name to select.
- * @returns {object} - The chosen file.
- */
-function pickFile(torrent, filePath) {
-  if (torrent.files.length === 0) throw new Error('torrent contains no files');
+/** Chooses which file in the torrent is the PMTiles archive. */
+function pickFile(torrent: WtTorrent, filePath?: string): WtFile {
+  if (torrent.files.length === 0) throw new Error("torrent contains no files");
 
   if (filePath) {
     const match = torrent.files.find(
@@ -100,28 +150,33 @@ function pickFile(torrent, filePath) {
       throw new Error(
         `no file "${filePath}" in torrent (has: ${torrent.files
           .map((f) => f.path)
-          .join(', ')})`,
+          .join(", ")})`,
       );
     }
     return match;
   }
 
   const byLength = [...torrent.files].sort((a, b) => b.length - a.length);
-  return byLength.find((file) => file.name.endsWith('.pmtiles')) ?? byLength[0];
+  return byLength.find((file) => file.name.endsWith(".pmtiles")) ?? byLength[0];
 }
 
 /** Format version for resume files, so a change can invalidate old ones. */
 const RESUME_VERSION = 1;
 
-/**
- * Path of the resume file for a source key.
- * @param {string} resumePath - Directory holding resume data.
- * @param {string} key - The engine's stable key.
- * @returns {Promise<string>} - Absolute path of the resume file.
- */
-async function resumeFilePath(resumePath, key) {
-  const path = await import('node:path');
-  const safe = key.replace(/[^a-z0-9]+/gi, '_').slice(0, 120);
+interface ResumeData {
+  version: number;
+  infoHash: string;
+  numPieces: number;
+  dataFile: string;
+  dataSize: number;
+  dataMtimeMs: number;
+  bitfield: Uint8Array;
+}
+
+/** Path of the resume file for a source key. */
+async function resumeFilePath(resumePath: string, key: string): Promise<string> {
+  const path = await import("node:path");
+  const safe = key.replace(/[^a-z0-9]+/gi, "_").slice(0, 120);
   return path.join(resumePath, `${safe}.resume.json`);
 }
 
@@ -133,19 +188,19 @@ async function resumeFilePath(resumePath, key) {
  * data file is exactly the size and modification time it had when the bitfield
  * was written — any write to the file invalidates it, and the cost of being
  * wrong is one slow startup rather than corrupt tiles.
- * @param {string} resumePath - Directory holding resume data.
- * @param {string} key - The engine's stable key.
- * @param {string} dataPath - Directory holding the torrent's files.
- * @returns {Promise<object | null>} - Validated resume data, or null.
  */
-async function loadResume(resumePath, key, dataPath) {
+async function loadResume(
+  resumePath: string,
+  key: string,
+  dataPath: string,
+): Promise<ResumeData | null> {
   try {
     const [fs, path] = await Promise.all([
-      import('node:fs/promises'),
-      import('node:path'),
+      import("node:fs/promises"),
+      import("node:path"),
     ]);
     const file = await resumeFilePath(resumePath, key);
-    const saved = JSON.parse(await fs.readFile(file, 'utf8'));
+    const saved = JSON.parse(await fs.readFile(file, "utf8"));
     if (saved.version !== RESUME_VERSION) return null;
     if (!saved.dataFile || !saved.bitfield) return null;
 
@@ -155,7 +210,7 @@ async function loadResume(resumePath, key, dataPath) {
 
     return {
       ...saved,
-      bitfield: new Uint8Array(Buffer.from(saved.bitfield, 'base64')),
+      bitfield: new Uint8Array(Buffer.from(saved.bitfield, "base64")),
     };
   } catch {
     // Missing or unreadable resume data just means a cold start.
@@ -163,20 +218,17 @@ async function loadResume(resumePath, key, dataPath) {
   }
 }
 
-/**
- * Persists the torrent's bitfield alongside the identity of the data it
- * describes.
- * @param {string} resumePath - Directory holding resume data.
- * @param {string} key - The engine's stable key.
- * @param {object} torrent - The WebTorrent torrent.
- * @param {object} file - The archive file within the torrent.
- * @returns {Promise<void>} - Resolves once written, or silently on failure.
- */
-async function saveResume(resumePath, key, torrent, file) {
+/** Persists the bitfield alongside the identity of the data it describes. */
+async function saveResume(
+  resumePath: string,
+  key: string,
+  torrent: WtTorrent,
+  file: WtFile,
+): Promise<void> {
   try {
     const [fs, path] = await Promise.all([
-      import('node:fs/promises'),
-      import('node:path'),
+      import("node:fs/promises"),
+      import("node:path"),
     ]);
     const bitfield = torrent.bitfield?.buffer;
     if (!bitfield) return;
@@ -193,7 +245,7 @@ async function saveResume(resumePath, key, torrent, file) {
       dataFile,
       dataSize: stat.size,
       dataMtimeMs: Math.floor(stat.mtimeMs),
-      bitfield: Buffer.from(bitfield).toString('base64'),
+      bitfield: Buffer.from(bitfield).toString("base64"),
     });
     // Write then rename, so a crash cannot leave a half-written bitfield.
     await fs.writeFile(`${target}.tmp`, body);
@@ -203,102 +255,88 @@ async function saveResume(resumePath, key, torrent, file) {
   }
 }
 
-/**
- * Loads WebTorrent lazily, so it stays a genuinely optional dependency.
- * @returns {Promise<new (opts?: object) => object>} - The WebTorrent constructor.
- */
-async function loadWebTorrent() {
+type WebTorrentConstructor = new (opts?: Record<string, unknown>) => unknown;
+
+async function loadWebTorrent(): Promise<WebTorrentConstructor> {
   try {
-    // Indirect specifier on purpose: it stops bundlers from pulling a
-    // Node-flavoured torrent client into builds that never use it.
-    const specifier = 'webtorrent';
-    const mod = await import(specifier);
-    const ctor = mod.default ?? mod;
-    if (typeof ctor !== 'function') {
-      throw new Error('webtorrent module did not export a constructor');
+    // Indirect specifier on purpose: it keeps `webtorrent` a genuinely optional
+    // dependency (no types required to compile) and stops bundlers from pulling
+    // a Node-flavoured torrent client into browser builds that never use it.
+    const specifier = "webtorrent";
+    const mod = (await import(specifier)) as {
+      default?: WebTorrentConstructor;
+    };
+    const ctor = mod.default ?? (mod as unknown as WebTorrentConstructor);
+    if (typeof ctor !== "function") {
+      throw new Error("webtorrent module did not export a constructor");
     }
     return ctor;
   } catch (error) {
     throw new Error(
       "WebTorrentEngine requires the optional peer dependency 'webtorrent'. " +
-        'Install it, or pass an existing client via options.client. ' +
-        `(${error.message})`,
+        "Install it, or pass an existing client via options.client. " +
+        `(${(error as Error).message})`,
       { cause: error },
     );
   }
 }
 
 /**
- * A TorrentEngine backed by WebTorrent.
+ * A {@link TorrentEngine} backed by WebTorrent.
  *
  * Works in Node and in the browser, and is the only engine that can bridge the
  * two: browser peers speak WebRTC and conventional clients speak TCP/uTP, so a
  * WebTorrent-based server is what lets one swarm serve both.
  *
  * Note this is a BitTorrent v1 engine — WebTorrent does not implement BEP 52,
- * so v2 merkle verification and btmh magnets need a different engine.
- * @implements {import('../types.js').TorrentEngine}
+ * so v2 merkle verification and `btmh` magnets need a different engine.
  */
-export class WebTorrentEngine {
-  #torrentId;
-  #options;
-  #client;
-  #torrent;
-  #file;
+export class WebTorrentEngine implements TorrentEngine {
+  readonly key: string;
+
+  #torrentId: unknown;
+  #options: WebTorrentEngineOptions;
+  #client?: WtClient;
+  #torrent?: WtTorrent;
+  #file?: WtFile;
   #ownsClient = false;
   #ownsTorrent = true;
-  #readyPromise;
+  #readyPromise?: Promise<TorrentInfo>;
   #destroyed = false;
-  #resumeTimer;
+  #resumeTimer?: ReturnType<typeof setInterval>;
 
-  /**
-   * Creates a WebTorrent-backed engine.
-   * @param {unknown} torrentId - Magnet URI, infohash, .torrent buffer or path.
-   * @param {WebTorrentEngineOptions} [options] - Client and selection options.
-   */
-  constructor(torrentId, options = {}) {
+  constructor(torrentId: unknown, options: WebTorrentEngineOptions = {}) {
     this.#torrentId = torrentId;
     this.#options = options;
-    /** @type {string} */
     this.key = deriveKey(torrentId);
   }
 
-  /**
-   * The underlying torrent, once metadata has arrived. For swarm stats.
-   * @returns {object | undefined} - The WebTorrent torrent.
-   */
-  get torrent() {
+  /** The underlying torrent, once metadata has arrived. For swarm stats. */
+  get torrent(): WtTorrent | undefined {
     return this.#torrent;
   }
 
-  /**
-   * Resolves torrent metadata, starting the client on first call.
-   * @returns {Promise<import('../types.js').TorrentInfo>} - The metadata.
-   */
-  ready() {
+  ready(): Promise<TorrentInfo> {
     if (!this.#readyPromise) this.#readyPromise = this.#start();
     return this.#readyPromise;
   }
 
-  /**
-   * Reads a byte range out of the archive file.
-   * @param {number} offset - Byte offset into the file.
-   * @param {number} length - Number of bytes to read.
-   * @param {import('../types.js').ReadRangeOptions} [options] - Signal and priority.
-   * @returns {Promise<Uint8Array>} - Exactly length bytes.
-   */
-  async readRange(offset, length, options = {}) {
+  async readRange(
+    offset: number,
+    length: number,
+    options: ReadRangeOptions = {},
+  ): Promise<Uint8Array> {
     await this.ready();
-    const file = this.#file;
+    const file = this.#file as WtFile;
     const { signal } = options;
     if (signal?.aborted) throw abortError();
 
     const end = offset + length - 1;
     // WebTorrent's iterator selects the range at elevated priority and marks
     // pieces critical as it advances, which is exactly the behaviour we want
-    // for a blocking read. Driving next() by hand (rather than for await) is
-    // what lets an abort interrupt a stalled fetch instead of waiting for the
-    // next chunk to arrive.
+    // for a blocking read. Driving `next()` by hand (rather than `for await`)
+    // is what lets an abort interrupt a stalled fetch instead of waiting for
+    // the next chunk to arrive.
     const iterator = file[Symbol.asyncIterator]({ start: offset, end });
 
     const out = new Uint8Array(length);
@@ -332,14 +370,7 @@ export class WebTorrentEngine {
     return out;
   }
 
-  /**
-   * Marks a range for background download at the given priority.
-   * @param {number} offset - Byte offset into the file.
-   * @param {number} length - Number of bytes.
-   * @param {import('../types.js').Priority} priority - How urgently.
-   * @returns {void}
-   */
-  hint(offset, length, priority) {
+  hint(offset: number, length: number, priority: Priority): void {
     const torrent = this.#torrent;
     const file = this.#file;
     if (!torrent || !file || torrent.destroyed || length <= 0) return;
@@ -348,21 +379,17 @@ export class WebTorrentEngine {
     const last = Math.floor(
       (file.offset + offset + length - 1) / torrent.pieceLength,
     );
-    // eslint-disable-next-line security/detect-object-injection -- priority is a checked union of literals
     torrent.select(first, last, PRIORITY_VALUES[priority]);
-    if (priority === 'critical') torrent.critical(first, last);
+    if (priority === "critical") torrent.critical(first, last);
   }
 
   /**
    * Withdraws a previous hint, so the range stops competing for bandwidth.
    *
-   * This only clears non-streaming selections, which is what hint() creates —
+   * This only clears non-streaming selections, which is what `hint()` creates —
    * the selections an in-flight read makes for itself are untouched.
-   * @param {number} offset - Byte offset into the file.
-   * @param {number} length - Number of bytes.
-   * @returns {void}
    */
-  unhint(offset, length) {
+  unhint(offset: number, length: number): void {
     const torrent = this.#torrent;
     const file = this.#file;
     if (!torrent || !file || torrent.destroyed || length <= 0) return;
@@ -374,11 +401,7 @@ export class WebTorrentEngine {
     torrent.deselect(first, last);
   }
 
-  /**
-   * Releases the torrent, and the client if this engine created it.
-   * @returns {Promise<void>} - Resolves once torn down.
-   */
-  async destroy() {
+  async destroy(): Promise<void> {
     if (this.#destroyed) return;
     this.#destroyed = true;
 
@@ -393,7 +416,7 @@ export class WebTorrentEngine {
         this.#options.resumePath,
         this.key,
         this.#torrent,
-        this.#file,
+        this.#file as WtFile,
       );
     }
 
@@ -405,7 +428,7 @@ export class WebTorrentEngine {
     this.#readyPromise = undefined;
 
     if (this.#ownsClient && client) {
-      await new Promise((resolve) => client.destroy(() => resolve()));
+      await new Promise<void>((resolve) => client.destroy(() => resolve()));
       return;
     }
     // Shared client: drop our torrent but leave the client (and its other
@@ -419,15 +442,14 @@ export class WebTorrentEngine {
   /**
    * Periodically persists resume data, so a crash costs at most one interval
    * of re-hashing rather than the whole store.
-   * @returns {void}
    */
-  #startResumeTimer() {
+  #startResumeTimer(): void {
     if (!this.#options.resumePath || !this.#options.path) return;
     const interval = this.#options.resumeIntervalMs ?? 60000;
     this.#resumeTimer = setInterval(() => {
       if (this.#torrent && this.#file) {
-        saveResume(
-          this.#options.resumePath,
+        void saveResume(
+          this.#options.resumePath as string,
           this.key,
           this.#torrent,
           this.#file,
@@ -437,39 +459,35 @@ export class WebTorrentEngine {
     this.#resumeTimer.unref?.();
   }
 
-  /**
-   * Removes resume data that turned out not to describe this torrent.
-   * @returns {Promise<void>} - Resolves once removed, or silently on failure.
-   */
-  async #discardResume() {
+  /** Removes resume data that turned out not to describe this torrent. */
+  async #discardResume(): Promise<void> {
     try {
-      const fs = await import('node:fs/promises');
-      const target = await resumeFilePath(this.#options.resumePath, this.key);
+      const fs = await import("node:fs/promises");
+      const target = await resumeFilePath(
+        this.#options.resumePath as string,
+        this.key,
+      );
       await fs.rm(target, { force: true });
     } catch {
       /* nothing useful to do if it cannot be removed */
     }
   }
 
-  /**
-   * Adds the torrent and waits for metadata.
-   * @returns {Promise<import('../types.js').TorrentInfo>} - The metadata.
-   */
-  async #start() {
-    if (this.#destroyed) throw new Error('engine is destroyed');
+  async #start(): Promise<TorrentInfo> {
+    if (this.#destroyed) throw new Error("engine is destroyed");
 
     const provided = this.#options.client;
-    let client;
+    let client: WtClient;
     if (provided) {
-      client = typeof provided === 'function' ? await provided() : provided;
+      client = typeof provided === "function" ? await provided() : provided;
     } else {
       const WebTorrent = await loadWebTorrent();
-      client = new WebTorrent(this.#options.clientOptions ?? {});
+      client = new WebTorrent(this.#options.clientOptions ?? {}) as WtClient;
       this.#ownsClient = true;
     }
     this.#client = client;
 
-    const addOptions = {
+    const addOptions: Record<string, unknown> = {
       // Without this WebTorrent selects every piece and starts downloading the
       // whole archive. We want on-demand ranges only — the point of the
       // exercise is serving a 700 GiB map without holding 700 GiB.
@@ -489,7 +507,7 @@ export class WebTorrentEngine {
     // Resume data, when it is still valid, replaces a full re-hash of the
     // store. WebTorrent ignores a bitfield whose byte length does not match
     // the piece count, so a mismatched one degrades to a normal verify.
-    let resume = null;
+    let resume: ResumeData | null = null;
     if (this.#options.resumePath && this.#options.path) {
       resume = await loadResume(
         this.#options.resumePath,
@@ -500,14 +518,9 @@ export class WebTorrentEngine {
     }
 
     const timeoutMs = this.#options.readyTimeoutMs ?? 60000;
-    const torrent = await new Promise((resolve, reject) => {
+    const torrent = await new Promise<WtTorrent>((resolve, reject) => {
       let settled = false;
-      /**
-       * Runs the first settlement only, clearing the timer.
-       * @param {() => void} fn - The settle action.
-       * @returns {void}
-       */
-      const finish = (fn) => {
+      const finish = (fn: () => void) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -523,26 +536,26 @@ export class WebTorrentEngine {
         );
       }, timeoutMs);
 
-      let added;
+      let added: WtTorrent;
       try {
-        added = client.add(this.#torrentId, addOptions, (t) =>
+        added = (client as WtClient).add(this.#torrentId, addOptions, (t) =>
           finish(() => resolve(t)),
         );
       } catch (error) {
-        finish(() => reject(error));
+        finish(() => reject(error as Error));
         return;
       }
-      added.once('error', (error) => {
+      added.once("error", (error: unknown) => {
         // A shared client reports a duplicate by destroying the torrent it just
         // built and then invoking the callback with the one it already holds,
         // so this particular error is not fatal — the callback still resolves
         // us. Record that the torrent is not ours, so destroy() does not tear
         // it out from under whoever added it first.
-        if (/duplicate torrent/i.test(error?.message ?? '')) {
+        if (/duplicate torrent/i.test((error as Error)?.message ?? "")) {
           this.#ownsTorrent = false;
           return;
         }
-        finish(() => reject(error));
+        finish(() => reject(error as Error));
       });
     });
 

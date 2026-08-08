@@ -45,7 +45,7 @@ describe('end to end against a real PMTiles archive', () => {
     assert.strictEqual(header.tileDataOffset, 399);
     assert.strictEqual(header.maxZoom, 0);
 
-    const metadata = await archive.getMetadata();
+    const metadata = (await archive.getMetadata()) as { name: string };
     assert.strictEqual(metadata.name, 'test_fixture_1.pmtiles');
 
     const tile = await archive.getZxy(0, 0, 0);
