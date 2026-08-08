@@ -92,6 +92,8 @@ jobs:
           body: |
             Automated version bump to `v${{ steps.version-details.outputs.version }}`.
 
-            Merging this does **not** publish. To release, create a GitHub
-            Release tagged `v${{ steps.version-details.outputs.version }}` once
-            this is merged — that is what triggers the publish workflow.
+            **Merging this publishes to npm.** The release workflow runs on push
+            to `main`, sees this version is not on the registry yet, and
+            publishes it — then creates the
+            `v${{ steps.version-details.outputs.version }}` tag and GitHub
+            Release.
