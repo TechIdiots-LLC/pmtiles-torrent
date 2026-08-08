@@ -15,6 +15,11 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    # Matches the trusted-publisher configuration on npmjs.com: npm rejects the
+    # OIDC token unless the workflow ran in this environment, so a workflow
+    # edited on another branch cannot publish. It is also where publish
+    # protection rules (required reviewers, allowed branches) belong.
+    environment: release
     steps:
       - uses: actions/checkout@v6
 
