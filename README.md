@@ -43,8 +43,13 @@ Two other properties fall out of the transport for free:
 npm install pmtiles-torrent pmtiles webtorrent
 ```
 
-`pmtiles` is a peer dependency (used only for types at build time). `webtorrent` is an *optional*
-peer dependency, needed only if you use the bundled engine.
+Ships ESM, CJS and TypeScript declarations, so it works from either module system with types
+either way.
+
+`pmtiles` is a peer dependency because *you* construct the `PMTiles` instance — this package
+never imports it, it only produces something `PMTiles` accepts. `webtorrent` is an *optional*
+peer dependency, needed only for the WebTorrent engine; the libtorrent engine needs a Python
+sidecar instead, and neither is required to install the package.
 
 ## What the source does
 
@@ -166,6 +171,7 @@ interface TorrentEngine {
   ready(): Promise<TorrentInfo>;            // pieceLength, fileLength, fileOffset, infoHash
   readRange(offset, length, opts): Promise<Uint8Array>;
   hint?(offset, length, priority): void;    // optional background prioritisation
+  unhint?(offset, length): void;            // withdraw a hint; required for hydration
   destroy(): void | Promise<void>;
 }
 ```
@@ -173,43 +179,120 @@ interface TorrentEngine {
 Everything PMTiles-specific lives above that line, so a new backend — or a port to another
 language — only means reimplementing the engine.
 
+`hint` and `unhint` are a pair. Idle hydration is skipped unless an engine implements both,
+because queuing background work with no way to call it off is worse than not queuing it.
+
 ### WebTorrentEngine (bundled)
 
+Accepts a magnet URI, a bare infohash, or a path to a `.torrent` file.
+
 ```ts
-new WebTorrentEngine(magnetUri, {
-  client,        // reuse one client across archives: one peer pool, one port, one DHT node
-  path,          // chunk store location; persist it to keep seeding across restarts
-  filePath,      // pick a file inside a multi-file torrent
-  announce,      // extra trackers
-  readyTimeoutMs // default 60s
+new WebTorrentEngine(torrentId, {
+  client,         // reuse one client across archives: one peer pool, one port, one DHT node
+  path,           // chunk store location; persist it to keep seeding across restarts
+  resumePath,     // where to keep resume data — see above; usually the same as `path`
+  filePath,       // pick a file inside a multi-file torrent
+  announce,       // extra trackers
+  maxWebConns,    // connections per web seed; WebTorrent's own default of 4 is low
+  readyTimeoutMs, // default 60s
 });
 ```
 
 The torrent is added with `deselect: true`, so nothing downloads until a range is requested.
 Without that, WebTorrent selects every piece and starts pulling the entire archive.
 
+**Prefer a `.torrent` file over a magnet.** A magnet carries only an infohash, so the client must
+find peers and complete a BEP 9 metadata exchange before it knows anything about the archive —
+measured at somewhere between 90 and 240 seconds against a 72 GiB archive. A `.torrent` already
+contains the metadata and was ready immediately.
+
 WebTorrent is the only engine that can bridge both halves of a swarm: browser peers speak WebRTC
 and conventional clients speak TCP/uTP, and they cannot see each other directly. A
 WebTorrent-based server is what lets one swarm serve both.
 
 **This is a BitTorrent v1 engine.** WebTorrent does not implement BEP 52 — no merkle
-verification, no `btmh` magnets. v2 support means an engine over libtorrent (which is where
-qBittorrent's v2 support comes from; qBittorrent itself exposes only file-level priorities, not
-the piece-level primitives — `set_piece_deadline`, `read_piece` — that random access needs).
+verification, no `btmh` magnets. For those, use the libtorrent engine below.
+
+### LibtorrentEngine
+
+Talks to libtorrent through a Python sidecar shipped in this package. It adds three things
+WebTorrent cannot:
+
+- **`set_piece_deadline`** — promotes one piece to the front of the queue rather than waiting for
+  the normal picker, which is exactly what a blocking tile read wants.
+- **Per-piece priorities** — hydration can sit at priority 1 and drop to 0 the instant a read
+  arrives, rather than selecting and deselecting ranges wholesale.
+- **BitTorrent v2 (BEP 52)** — per-file merkle trees with 16 KiB leaf blocks, so a peer can verify
+  a small block without holding the whole hash list. The right shape for random access.
+
+```ts
+import { LibtorrentEngine } from "pmtiles-torrent/libtorrent";
+
+new LibtorrentEngine(torrentId, {
+  path,            // data store — required
+  resumeDir,       // libtorrent's own resume data; skips re-hashing on start
+  python,          // executable, default "python3"
+  listen,          // e.g. "0.0.0.0:6881"
+  maxConnections,  // peer cap; every peer is a NAT table entry
+});
+```
+
+Needs libtorrent's Python bindings: `apt install python3-libtorrent` on Debian/Ubuntu,
+`brew install libtorrent-rasterbar` on macOS, or `pip install libtorrent` where wheels exist.
+
+WebTorrent stays the default: it needs no external install and is the only option in a browser.
+Reach for libtorrent on a server that wants v2, faster piece prioritisation, or scale.
+
+## Web seeds
+
+If the torrent carries a BEP 19 `url-list` — an HTTP URL serving the same bytes — it is used
+automatically, and it changes the picture more than any client tuning does. A web seed is always
+available and usually far faster than a small swarm, so it removes both the wait for a first peer
+and the bandwidth ceiling of a handful of seeders.
+
+Measured with DHT and trackers **disabled entirely**, a tile was served in 673 ms with no
+BitTorrent peers at all — every byte over HTTP.
+
+Nothing needs configuring on this side; the URL is in the torrent. What matters is that whoever
+creates the torrent includes it (`mktorrent -w https://…`). The one setting worth raising is
+`maxWebConns`, since WebTorrent allows only four simultaneous connections per web seed by default
+— which throttles exactly the source most worth leaning on.
+
+If you publish archives over HTTP already, adding a web seed to their torrents is the single
+largest improvement available here.
 
 ## Development
 
-This package lives inside the tileserver-gl-wdb repository and is consumed from it as a
-`file:packages/pmtiles-torrent` dependency. It is plain ESM JavaScript with JSDoc types and has
-no build step, so `npm ci --omit=dev` in the Docker image works without a toolchain.
+TypeScript source in `src/`, compiled by tsup to ESM, CJS and declarations in `dist/`. Consumers
+install the compiled output, so nothing downstream needs a toolchain.
 
 ```sh
-npm test        # from this directory, or:
-node --test packages/pmtiles-torrent/test/*.test.js   # from the repo root
+npm install
+npm run tsc     # typecheck
+npm test        # 36 tests
+npm run build   # dist/esm, dist/cjs, .d.ts
 ```
 
+`prepublishOnly` runs all three, so a package that does not typecheck, pass or build cannot be
+published.
+
 Tests run against an in-memory engine with controllable timing, so concurrency and cancellation
-behaviour is covered without a swarm, plus an end-to-end read of a real PMTiles archive.
+behaviour is covered without a swarm, plus an end-to-end read of a real PMTiles archive fixture.
+The libtorrent sidecar is exercised separately in CI, which installs libtorrent to compile and
+smoke-test it — otherwise it is the one component nothing checks.
+
+### Releasing
+
+Two stages, so nothing publishes by accident:
+
+1. **Actions → Create bump version PR** — bumps the version, promotes the `## master` changelog
+   section to that number, and opens a PR. Nothing is published here.
+2. **Create a GitHub Release** tagged `vX.Y.Z` once that PR is merged. That triggers the publish,
+   which refuses to run if the tag does not match `package.json`, and derives the dist-tag from
+   the version so a prerelease cannot become `latest`.
+
+Publishing uses npm trusted publishing (OIDC) from the `release` environment — there is no
+long-lived npm token.
 
 ## License and attribution
 
