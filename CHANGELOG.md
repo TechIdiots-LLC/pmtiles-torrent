@@ -7,6 +7,11 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.2.0
+### ✨ Features and improvements
+
+### 🐞 Bug fixes
+
 ## 0.1.0
 ### ✨ Features and improvements
 - TypeScript source, compiled to a JavaScript package. Consumers get ESM, CJS and real `.d.ts` declarations from `dist/`; nothing needs a toolchain to install it.
