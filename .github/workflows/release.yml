@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance
+  id-token: write # OIDC, for npm trusted publishing and provenance
 
 jobs:
   publish:
@@ -21,7 +21,9 @@ jobs:
       - name: Setup node env 📦
         uses: actions/setup-node@v6
         with:
-          node-version-file: 'package.json'
+          # Pinned rather than read from engines.node: trusted publishing needs
+          # npm 11.5.1+, which ships with Node 22.14+.
+          node-version: '24'
           check-latest: true
           registry-url: 'https://registry.npmjs.org'
 
@@ -55,7 +57,21 @@ jobs:
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Ensure npm supports trusted publishing
+        run: |
+          # Trusted publishing exchanges the workflow's OIDC token for
+          # short-lived credentials, and needs npm 11.5.1 or newer. Older npm
+          # ignores the token and then fails on missing auth, which is a
+          # confusing way to discover the version is wrong.
+          echo "npm $(npm --version)"
+          node -e "process.exit(require('semver').gte(process.argv[1],'11.5.1')?0:1)" "$(npm --version)" 2>/dev/null || npm install -g npm@latest
+          echo "publishing with npm $(npm --version)"
+
       - name: Publish
+        # No NODE_AUTH_TOKEN: authentication comes from the OIDC token above,
+        # once this repo and workflow filename are registered as a trusted
+        # publisher for the package on npmjs.com. To use a classic token
+        # instead, delete this comment and add:
+        #   env:
+        #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance --tag ${{ steps.disttag.outputs.tag }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
