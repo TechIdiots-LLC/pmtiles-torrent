@@ -8,8 +8,38 @@
 - _...Add new stuff here..._
 
 ## 0.2.0
+
+Documentation only. `src/` and `package.json` are byte-identical to 0.1.0 — this
+release exists because the page npm shows described the package as it was before
+it was extracted into its own repository.
+
 ### ✨ Features and improvements
-- workflow test
+- **README rewritten for the standalone package.** The Development section still said this
+  lived inside tileserver-gl, was consumed as a `file:packages/pmtiles-torrent` dependency,
+  was plain ESM with JSDoc types, and had no build step. All four were wrong. It now covers
+  the TypeScript build, the `prepublishOnly` gate that blocks publishing anything which does
+  not typecheck, pass and build, and the two-stage release.
+- **The libtorrent engine is documented**, having had no section at all despite being what
+  provides BitTorrent v2, per-piece priorities and `set_piece_deadline`. Includes what to
+  install and when to prefer it over WebTorrent.
+- **Web seeds are documented**, previously unmentioned despite being the largest performance
+  lever available here: a torrent carrying a BEP 19 `url-list` served a tile in 673 ms with
+  DHT and trackers disabled entirely. Notes that `maxWebConns` is worth raising, because
+  WebTorrent's default of four connections per web seed throttles exactly the source most
+  worth leaning on.
+- **`.torrent` files are documented as preferable to magnets.** A magnet must complete a
+  BEP 9 metadata exchange before anything else can happen — measured between 90 and 240
+  seconds against a 72 GiB archive, where a `.torrent` was ready immediately.
+- `unhint` added to the documented engine interface. It is half of a pair: idle hydration is
+  skipped unless an engine implements both, since queuing background work with no way to
+  call it off is worse than not queuing it.
+- `WebTorrentEngine` options now list `resumePath` and `maxWebConns`, and the constructor is
+  described as taking a magnet, a bare infohash **or** a `.torrent` path.
+
+### 🐞 Bug fixes
+- The install note claimed `pmtiles` was a peer dependency "used only for types at build
+  time". This package never imports `pmtiles` at all — the consumer constructs the `PMTiles`
+  instance, and this only produces something that instance accepts.
 
 ## 0.1.0
 ### ✨ Features and improvements
