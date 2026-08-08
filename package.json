@@ -3,42 +3,21 @@
   "version": "0.1.0",
   "description": "Serve a PMTiles archive from a BitTorrent swarm — a torrent-backed Source for the pmtiles package",
   "type": "module",
-  "main": "dist/cjs/index.cjs",
-  "module": "dist/esm/index.js",
-  "types": "dist/esm/index.d.ts",
+  "main": "src/index.js",
   "exports": {
     "./package.json": "./package.json",
-    ".": {
-      "import": {
-        "types": "./dist/esm/index.d.ts",
-        "default": "./dist/esm/index.js"
-      },
-      "require": {
-        "types": "./dist/cjs/index.d.cts",
-        "default": "./dist/cjs/index.cjs"
-      }
-    },
-    "./webtorrent": {
-      "import": {
-        "types": "./dist/esm/webtorrent.d.ts",
-        "default": "./dist/esm/webtorrent.js"
-      },
-      "require": {
-        "types": "./dist/cjs/webtorrent.d.cts",
-        "default": "./dist/cjs/webtorrent.cjs"
-      }
-    }
+    ".": "./src/index.js",
+    "./webtorrent": "./src/engines/webtorrent.js",
+    "./libtorrent": "./src/engines/libtorrent.js"
   },
   "files": [
-    "dist",
     "src",
-    "NOTICE.md"
+    "sidecar",
+    "NOTICE.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsup",
-    "test": "tsx --test test/*.test.ts",
-    "tsc": "tsc --noEmit",
-    "prepublishOnly": "npm run tsc && npm test && npm run build"
+    "test": "node --test test/*.test.js"
   },
   "keywords": [
     "pmtiles",
@@ -60,11 +39,21 @@
       "optional": true
     }
   },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || 24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TechIdiots-LLC/pmtiles-torrent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TechIdiots-LLC/pmtiles-torrent/issues"
+  },
+  "homepage": "https://github.com/TechIdiots-LLC/pmtiles-torrent#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
-    "@types/node": "^20.19.26",
-    "pmtiles": "^4.4.0",
-    "tsup": "^8.4.0",
-    "tsx": "^4.19.3",
-    "typescript": "^5.0.0"
+    "pmtiles": "^4.4.1"
   }
 }

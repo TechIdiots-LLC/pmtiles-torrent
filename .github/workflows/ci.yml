@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: Test on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          check-latest: true
+      - run: npm ci --prefer-offline --no-audit
+      - run: npm test
+
+  sidecar:
+    name: libtorrent sidecar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      # The sidecar cannot be exercised without libtorrent present, so install
+      # it rather than leave the one non-JS component untested.
+      - run: pip install libtorrent
+      - run: python -m py_compile sidecar/libtorrent_sidecar.py
+      - name: Smoke test the protocol
+        run: |
+          echo '{"id":1,"op":"version","params":{}}' | python sidecar/libtorrent_sidecar.py | tail -1 | tee /dev/stderr | grep -q '"ok": *true'
