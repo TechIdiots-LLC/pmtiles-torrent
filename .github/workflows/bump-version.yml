@@ -25,6 +25,10 @@ on:
         type: string
         default: 'pre'
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   bump-version-pr:
     name: Bump version PR
@@ -88,4 +92,6 @@ jobs:
           body: |
             Automated version bump to `v${{ steps.version-details.outputs.version }}`.
 
-            Merging this publishes to npm via the release workflow.
+            Merging this does **not** publish. To release, create a GitHub
+            Release tagged `v${{ steps.version-details.outputs.version }}` once
+            this is merged — that is what triggers the publish workflow.
