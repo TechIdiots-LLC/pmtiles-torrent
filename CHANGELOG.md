@@ -2,7 +2,9 @@
 
 ## master
 ### ✨ Features and improvements
-- _...Add new stuff here..._
+- Document which WebTorrent major version to use. webtorrent 3 needs Node 22 but works as
+  installed; webtorrent 2 runs on older Node but needs a `uint8-util` override, without which
+  every magnet add throws.
 
 ### 🐞 Bug fixes
 - _...Add new stuff here..._

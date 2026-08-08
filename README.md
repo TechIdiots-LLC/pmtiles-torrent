@@ -51,6 +51,10 @@ never imports it, it only produces something `PMTiles` accepts. `webtorrent` is 
 peer dependency, needed only for the WebTorrent engine; the libtorrent engine needs a Python
 sidecar instead, and neither is required to install the package.
 
+Installing `webtorrent` on Node 22 or newer gets you webtorrent 3, which is what you want. On
+Node 20 you get webtorrent 2, which needs a dependency override to add magnets at all — see
+[Which WebTorrent version](#which-webtorrent-version).
+
 ## What the source does
 
 - **Piece mapping.** Each requested range expands to the pieces covering it, clipped to the
@@ -212,6 +216,34 @@ WebTorrent-based server is what lets one swarm serve both.
 
 **This is a BitTorrent v1 engine.** WebTorrent does not implement BEP 52 — no merkle
 verification, no `btmh` magnets. For those, use the libtorrent engine below.
+
+#### Which WebTorrent version
+
+The peer range is `>=2`, but the two major versions do not behave the same and the difference
+is not one you want to discover at runtime.
+
+| | Node | `uint8-util` workaround |
+| --- | --- | --- |
+| webtorrent 3.x | `>=22` | not needed |
+| webtorrent 2.x | `>=12` | **required** |
+
+**Use webtorrent 3 if your Node version allows it.** On webtorrent 2.x, `uint8-util` 2.3.0
+rewrote `arr2hex` to assume a typed array, and 2.x hands it the infohash as a hex string — so
+every magnet add throws `TypeError: The first argument must be of type string or an instance of
+Buffer...`. The range is unpinned, so a fresh install picks up the break with no version change
+of your own. Pin it in the *application* — `overrides` only applies from the root package, which
+is why this library cannot fix it for you:
+
+```json
+{
+  "overrides": {
+    "uint8-util": "2.2.5"
+  }
+}
+```
+
+webtorrent 3 does not pass a hex string there and needs no override, at the cost of requiring
+Node 22. That is the only reason this package still admits 2.x at all.
 
 ### LibtorrentEngine
 
