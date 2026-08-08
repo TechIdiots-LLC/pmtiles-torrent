@@ -1,24 +1,68 @@
 name: Release
 
-# Fires when a release is published. The dist-tag follows the version, so a
-# prerelease lands under "next" and cannot be installed by an unsuspecting
-# `npm install pmtiles-torrent`.
+# Merging the bump PR is the release. This checks whether the version in
+# package.json is already on npm and publishes if it is not, which is the same
+# pattern tileserver-gl and maplibre-maui-ac use — no separate "create a GitHub
+# Release" step to remember, and re-running on an unchanged version is a no-op.
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
-  contents: read
+  contents: write # to tag the published commit
   id-token: write # OIDC, for npm trusted publishing and provenance
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  version-check:
+    name: Check if version is published
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      published: ${{ steps.check.outputs.published }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          check-latest: true
+
+      - name: Check if version is published
+        id: check
+        env:
+          PACKAGE: pmtiles-torrent
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          # `npm view … versions --json` returns an array, but a bare string
+          # when the package has exactly one version, and nothing at all when it
+          # does not exist yet. Node handles all three; jq quietly gets the
+          # single-version case wrong and would republish an existing version.
+          PUBLISHED="$(npm view "$PACKAGE" versions --json 2>/dev/null | node -e '
+            let raw = "";
+            process.stdin.on("data", (d) => (raw += d)).on("end", () => {
+              let versions;
+              try { versions = JSON.parse(raw); } catch { versions = []; }
+              if (!Array.isArray(versions)) versions = versions ? [versions] : [];
+              process.stdout.write(versions.includes(process.argv[1]) ? "true" : "false");
+            });
+          ' "$VERSION")"
+          [ -n "$PUBLISHED" ] || PUBLISHED=false
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+          echo "version: $VERSION | already published: $PUBLISHED"
+
   publish:
     name: Publish to npm
+    needs: version-check
+    if: needs.version-check.outputs.published == 'false'
     runs-on: ubuntu-latest
     # Matches the trusted-publisher configuration on npmjs.com: npm rejects the
     # OIDC token unless the workflow ran in this environment, so a workflow
-    # edited on another branch cannot publish. It is also where publish
-    # protection rules (required reviewers, allowed branches) belong.
+    # edited on another branch cannot publish. Protection rules attach here.
     environment: release
     steps:
       - uses: actions/checkout@v6
@@ -41,27 +85,6 @@ jobs:
           npm test
           npm run build
 
-      - name: Check the tag matches package.json
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          PKG=$(node -p "require('./package.json').version")
-          if [ "$TAG" != "$PKG" ]; then
-            echo "Release tag $TAG does not match package.json version $PKG" >&2
-            exit 1
-          fi
-
-      - name: Choose dist-tag
-        id: disttag
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          # A version carrying a prerelease identifier must not become "latest",
-          # or everyone installing the package gets it by default.
-          if [[ "$VERSION" == *-* ]]; then
-            echo "tag=next" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Ensure npm supports trusted publishing
         run: |
           # Trusted publishing exchanges the workflow's OIDC token for
@@ -70,13 +93,35 @@ jobs:
           # confusing way to discover the version is wrong.
           echo "npm $(npm --version)"
           node -e "process.exit(require('semver').gte(process.argv[1],'11.5.1')?0:1)" "$(npm --version)" 2>/dev/null || npm install -g npm@latest
-          echo "publishing with npm $(npm --version)"
+
+      - name: Choose dist-tag
+        id: disttag
+        run: |
+          VERSION="${{ needs.version-check.outputs.version }}"
+          # A version carrying a prerelease identifier must not become "latest",
+          # or everyone installing the package gets it by default.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Publish
         # No NODE_AUTH_TOKEN: authentication comes from the OIDC token above,
-        # once this repo and workflow filename are registered as a trusted
-        # publisher for the package on npmjs.com. To use a classic token
-        # instead, delete this comment and add:
-        #   env:
-        #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # via the trusted publisher registered for this repo and workflow on
+        # npmjs.com.
         run: npm publish --access public --provenance --tag ${{ steps.disttag.outputs.tag }}
+
+      - name: Tag and release
+        # After publishing, so a failure here leaves a published package
+        # without a tag rather than a tag pointing at nothing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          NOTES="Published to npm as pmtiles-torrent@$VERSION"
+          FLAGS=""
+          case "$VERSION" in
+            *-*) FLAGS="--prerelease" ;;
+          esac
+          gh release create "v$VERSION" --title "v$VERSION" --notes "$NOTES" $FLAGS
