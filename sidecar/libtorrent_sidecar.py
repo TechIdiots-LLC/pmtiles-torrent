@@ -450,4 +450,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Windows delivers a console Ctrl-C to every process in the group, so
+        # this arrives here as well as in the parent — usually while blocked
+        # reading stdin. The parent is already shutting us down deliberately;
+        # printing a traceback on the way out makes an ordinary stop look like
+        # a crash, and buries the lines that say what actually happened.
+        pass
+    except BrokenPipeError:
+        # The parent closed the pipe before we finished writing. Same story:
+        # it is how a stop looks from this end, not a fault.
+        pass

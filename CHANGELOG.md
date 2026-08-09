@@ -1,6 +1,14 @@
 # pmtiles-torrent changelog
 
 ## master
+### 🐞 Bug fixes
+- **The libtorrent sidecar no longer prints a traceback when it is stopped.** Windows delivers a
+  console Ctrl-C to every process in the group, so the sidecar received it too — usually while
+  blocked reading stdin — and Python printed a `KeyboardInterrupt` stack trace on the way out. The
+  parent was already shutting it down deliberately; a stack trace at the end of a clean stop reads
+  as a crash and buries the lines that say what actually happened. A closed pipe is treated the
+  same way, for the same reason.
+
 ### ✨ Features and improvements
 - Document which WebTorrent major version to use. webtorrent 3 needs Node 22 but works as
   installed; webtorrent 2 runs on older Node but needs a `uint8-util` override, without which
