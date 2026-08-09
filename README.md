@@ -308,6 +308,14 @@ npm run build   # dist/esm, dist/cjs, .d.ts
 `prepublishOnly` runs all three, so a package that does not typecheck, pass or build cannot be
 published.
 
+The Python sidecar has its own tests, kept out of `npm test` because they need libtorrent actually
+installed — and what they check is precisely what this build of the bindings does or does not
+expose:
+
+```sh
+npm run test:sidecar
+```
+
 Tests run against an in-memory engine with controllable timing, so concurrency and cancellation
 behaviour is covered without a swarm, plus an end-to-end read of a real PMTiles archive fixture.
 The libtorrent sidecar is exercised separately in CI, which installs libtorrent to compile and

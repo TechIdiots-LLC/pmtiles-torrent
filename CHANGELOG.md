@@ -2,6 +2,14 @@
 
 ## master
 ### 🐞 Bug fixes
+- **The libtorrent sidecar reports peers again.** `peer_info.utp_socket` is in the C++ header but
+  not in the 2.x Python bindings, so reading it raised on the first peer and the caller received an
+  empty list — an archive downloading at 10 MiB/s from a connected seed reported having no peers at
+  all. Peer fields are now read one at a time and flags looked up by name, so an attribute a given
+  build does not expose costs that attribute rather than the whole answer. Each peer also now says
+  whether it is an ordinary peer, a web seed, or an HTTP seed, which the totals cannot distinguish:
+  an archive pulling at full speed from one web seed and one pulling from a swarm look identical
+  until that single server goes away.
 - **The libtorrent sidecar no longer prints a traceback when it is stopped.** Windows delivers a
   console Ctrl-C to every process in the group, so the sidecar received it too — usually while
   blocked reading stdin — and Python printed a `KeyboardInterrupt` stack trace on the way out. The

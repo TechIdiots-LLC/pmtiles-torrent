@@ -48,6 +48,7 @@
     "build": "tsup",
     "tsc": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
+    "test:sidecar": "python test/test_sidecar_peers.py",
     "prepublishOnly": "npm run tsc && npm test && npm run build"
   },
   "keywords": [

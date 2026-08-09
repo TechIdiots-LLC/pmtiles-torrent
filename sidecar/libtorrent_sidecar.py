@@ -54,6 +54,84 @@ STATE_MAP = {
 }
 
 
+# Peer flags, looked up by name rather than assumed to exist.
+#
+# The bindings do not expose the same set across versions — `utp_socket` is in
+# the C++ header but absent from the 2.x Python bindings, while `i2p_socket`
+# beside it is present. Naming them here means a missing one reads as "this
+# build cannot tell me", instead of raising and costing the whole peer list.
+PEER_FLAGS = (
+    "interesting",
+    "choked",
+    "remote_interested",
+    "remote_choked",
+    "supports_extensions",
+    "local_connection",
+    "handshake",
+    "connecting",
+    "on_parole",
+    "seed",
+    "optimistic_unchoke",
+    "snubbed",
+    "upload_only",
+    "endgame_mode",
+    "holepunched",
+    "utp_socket",
+    "rc4_encrypted",
+    "plaintext_encrypted",
+)
+
+
+def _text(value):
+    """A str, whichever of bytes or str the bindings handed back."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def _has_flag(peer, name):
+    """Whether a named peer flag is set, or None where this build lacks it."""
+    bit = getattr(lt.peer_info, name, None)
+    if bit is None:
+        return None
+    return bool(peer.flags & bit)
+
+
+def _transport(peer):
+    """
+    How the peer is connected: utp, tcp, or unknown.
+
+    Reported as unknown rather than guessed at when the flag is missing. A
+    build that cannot answer should say so — "tcp" would be a fact invented to
+    fill a column.
+    """
+    utp = _has_flag(peer, "utp_socket")
+    if utp is None:
+        return "unknown"
+    return "utp" if utp else "tcp"
+
+
+def _peer_kind(peer):
+    """
+    Whether this is an ordinary peer, a web seed, or an HTTP seed.
+
+    Worth distinguishing: an archive pulling at full speed from a single web
+    seed and one pulling from the swarm look identical in the totals, and only
+    the first stops dead when that one server goes away.
+    """
+    kinds = {
+        getattr(lt.peer_info, "standard_bittorrent", object()): "peer",
+        getattr(lt.peer_info, "web_seed", object()): "web seed",
+        getattr(lt.peer_info, "http_seed", object()): "http seed",
+    }
+    return kinds.get(peer.connection_type, "peer")
+
+
+def _peer_flags(peer):
+    """Every set flag this build knows about, for the detail view."""
+    return [name for name in PEER_FLAGS if _has_flag(peer, name)]
+
+
 class Sidecar:
     """Owns the libtorrent session and answers requests from the parent."""
 
@@ -220,20 +298,37 @@ class Sidecar:
         return {"trackers": out}
 
     def op_peers(self, params):
-        """Report per-peer detail for one torrent."""
+        """
+        Report per-peer detail for one torrent.
+
+        Built one field at a time and per peer, because the alternative failed
+        badly: `peer_info.utp_socket` does not exist in the 2.x Python
+        bindings, so reading it raised on the first peer and the caller got an
+        empty list — a swarm downloading at 10 MiB/s reported as having no
+        peers at all. One optional attribute should cost that attribute, not
+        the answer.
+        """
         handle = self._handle(params["infoHash"])
         out = []
         for peer in handle.get_peer_info():
-            out.append(
-                {
-                    "address": f"{peer.ip[0]}:{peer.ip[1]}",
-                    "client": peer.client.decode() if isinstance(peer.client, bytes) else str(peer.client),
-                    "progress": peer.progress,
-                    "downloadSpeed": peer.down_speed,
-                    "uploadSpeed": peer.up_speed,
-                    "connection": "utp" if peer.flags & peer.utp_socket else "tcp",
-                }
-            )
+            entry = {}
+            for key, read in (
+                ("address", lambda p: f"{p.ip[0]}:{p.ip[1]}"),
+                ("client", lambda p: _text(p.client)),
+                ("progress", lambda p: p.progress),
+                ("downloadSpeed", lambda p: p.down_speed),
+                ("uploadSpeed", lambda p: p.up_speed),
+                ("connection", _transport),
+                ("kind", _peer_kind),
+                ("flags", _peer_flags),
+            ):
+                try:
+                    entry[key] = read(peer)
+                except Exception:
+                    # An attribute this build does not expose. Skipped, so the
+                    # rest of the peer still arrives.
+                    pass
+            out.append(entry)
         return out
 
     def op_create(self, params):
