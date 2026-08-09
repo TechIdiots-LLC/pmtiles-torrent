@@ -259,13 +259,20 @@ class Sidecar:
             flags |= lt.create_torrent.v2_only
 
         creator = lt.create_torrent(storage, piece_length, flags=flags)
-        for tracker in params.get("trackers", []):
-            creator.add_tracker(tracker)
+
+        # Trackers arrive as BEP 12 tiers: a list of lists, tried in order,
+        # everything within a tier tried together. Flattening them would turn a
+        # deliberate fallback order into a stampede.
+        for tier, group in enumerate(params.get("trackers", [])):
+            for tracker in group if isinstance(group, list) else [group]:
+                creator.add_tracker(tracker, tier)
         for seed in params.get("webSeeds", []):
             creator.add_url_seed(seed)
         if params.get("comment"):
             creator.set_comment(params["comment"])
-        creator.set_creator("pmtiles-swarm")
+        if params.get("private"):
+            creator.set_priv(True)
+        creator.set_creator(params.get("createdBy") or "pmtiles-swarm")
 
         lt.set_piece_hashes(creator, os.path.dirname(path) or ".")
         entry = creator.generate()
