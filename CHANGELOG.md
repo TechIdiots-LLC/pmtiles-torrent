@@ -1,6 +1,20 @@
 # pmtiles-torrent changelog
 
 ## master
+### ✨ Features and improvements
+- **`pieces`**, reporting which pieces a torrent holds, how rare each one is across the swarm, and
+  what each connected peer has. Reduced to a requested number of buckets before it is returned,
+  because full resolution does not survive the trip: a 698 GiB archive at 4 MiB pieces is 178,000
+  pieces. Availability reduces by the *rarest* piece in each bucket rather than the average — one
+  piece nobody has is the answer to "can this be completed", and an average hides it. Where
+  libtorrent 2.x declines to report availability (`piece_availability()` returns nothing without
+  the alert-based call), it is counted from the connected peers' own bitfields instead, and
+  `distributedCopies` is derived from the same data rather than left at zero beside a bar with
+  data in it.
+- **`rate_limits`**, setting the session's global download and upload rates on a running session.
+  Applied live rather than at startup, since a setting that only took effect on restart could not
+  drive a schedule.
+
 ### 🐞 Bug fixes
 - **The libtorrent sidecar reports peers again.** `peer_info.utp_socket` is in the C++ header but
   not in the 2.x Python bindings, so reading it raised on the first peer and the caller received an

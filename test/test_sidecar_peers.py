@@ -103,5 +103,63 @@ class PeerReporting(unittest.TestCase):
         self.assertIsInstance(peer["client"], str)
 
 
+
+class Bucketising(unittest.TestCase):
+    """Reducing a per-piece map to a drawable width."""
+
+    def test_covers_every_piece(self):
+        # A rounding gap at the end shows up as a bar that never reaches the
+        # right edge — and as an archive that looks unfinished when it is not.
+        for total, buckets in ((1000, 10), (178000, 1000), (7, 3), (999, 1000)):
+            values = list(range(total))
+            seen = set()
+
+            def collect(chunk):
+                seen.update(chunk)
+                return 0
+
+            sidecar._bucketise(values, buckets, collect)
+            self.assertIn(total - 1, seen, f"{total}/{buckets} dropped the last piece")
+            self.assertIn(0, seen, f"{total}/{buckets} dropped the first piece")
+
+    def test_every_bucket_gets_a_piece(self):
+        # Fewer pieces than columns must widen the pieces, not leave gaps.
+        out = sidecar._bucketise([1, 1, 1, 1], 16, lambda v: 1 if all(v) else 0)
+        self.assertEqual(len(out), 16)
+        self.assertTrue(all(out))
+
+    def test_all_versus_any(self):
+        pieces = [1] * 100
+        pieces[55] = 0
+        self.assertEqual(sidecar._bucketise(pieces, 10, lambda v: 1 if all(v) else 0)[5], 0)
+        holes = [0] * 100
+        holes[55] = 1
+        self.assertEqual(sidecar._bucketise(holes, 10, lambda v: 1 if any(v) else 0)[5], 1)
+
+    def test_availability_takes_the_rarest(self):
+        # An average would hide the one piece nobody has.
+        values = [9, 9, 9, 1, 9, 9, 9, 9, 9, 9]
+        out = sidecar._bucketise(values, 2, lambda v: min(min(v), 255))
+        self.assertEqual(out, [1, 9])
+
+    def test_empty(self):
+        self.assertEqual(sidecar._bucketise([], 10, lambda v: 0), [])
+
+
+class PieceFields(unittest.TestCase):
+    """The libtorrent fields the piece maps are built from."""
+
+    def test_the_bindings_expose_what_op_pieces_reads(self):
+        # The peers bug was exactly this: a field assumed present and absent in
+        # the 2.x bindings. Check rather than assume, against this build.
+        for name in ("pieces", "num_pieces", "distributed_copies"):
+            self.assertTrue(
+                hasattr(sidecar.lt.torrent_status, name), f"torrent_status.{name} is missing"
+            )
+        for name in ("piece_availability", "status"):
+            self.assertTrue(
+                hasattr(sidecar.lt.torrent_handle, name), f"torrent_handle.{name} is missing"
+            )
+        self.assertTrue(hasattr(sidecar.lt.peer_info, "pieces"))
 if __name__ == "__main__":
     unittest.main(verbosity=2)

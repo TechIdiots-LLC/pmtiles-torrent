@@ -82,6 +82,26 @@ PEER_FLAGS = (
 )
 
 
+def _bucketise(values, buckets, reduce_fn):
+    """
+    Reduces a per-piece sequence to a fixed number of buckets.
+
+    Every piece lands in exactly one bucket and every bucket gets at least one
+    piece, which matters at both ends: an archive with fewer pieces than
+    buckets must not produce empty columns, and one with far more must not drop
+    the last few pieces through a rounding gap.
+    """
+    total = len(values)
+    if total == 0:
+        return []
+    out = []
+    for index in range(buckets):
+        start = (index * total) // buckets
+        stop = max(start + 1, ((index + 1) * total) // buckets)
+        out.append(int(reduce_fn(values[start:stop])))
+    return out
+
+
 def _text(value):
     """A str, whichever of bytes or str the bindings handed back."""
     if isinstance(value, bytes):
@@ -296,6 +316,143 @@ class Sidecar:
                 "nextAnnounce": str(entry.get("next_announce") or ""),
             })
         return {"trackers": out}
+
+    def op_pieces(self, params):
+        """
+        Which pieces are held, how rare each one is, and what peers have.
+
+        Downsampled to `buckets` before it leaves, because full resolution does
+        not survive the trip: a 698 GiB archive at 4 MiB pieces is 178,000 of
+        them, and one byte each is a quarter-megabyte of JSON per poll. A bar
+        on a screen is a thousand columns wide at most, so the reduction costs
+        nothing that could have been displayed.
+
+        Availability reduces by **minimum** rather than average on purpose. The
+        question a person asks of that bar is "can I still complete this", and
+        one piece nobody has is the answer regardless of how well supplied its
+        neighbours are — an average would hide exactly the case worth seeing.
+        """
+        handle = self._handle(params["infoHash"])
+        status = handle.status()
+        if not status.has_metadata:
+            raise RuntimeError("metadata has not arrived yet")
+
+        info = handle.torrent_file()
+        total = info.num_pieces()
+        buckets = int(params.get("buckets") or 0) or total
+        buckets = max(1, min(buckets, total))
+
+        have = list(status.pieces or [])
+        # `have` reduces by minimum too: a bucket is only "complete" when every
+        # piece in it is, so a nearly-full bar cannot be mistaken for a done one.
+        held = _bucketise(have, buckets, lambda values: 1 if all(values) else 0)
+
+        # Peers are read once, up here, because availability is derived from
+        # them when libtorrent will not answer directly.
+        peer_infos = handle.get_peer_info()
+
+        try:
+            availability = list(handle.piece_availability())
+        except Exception:
+            availability = []
+
+        if not availability:
+            # `piece_availability()` returns nothing on a session that has not
+            # been asked to post it — the supported route in 2.x is an alert,
+            # which this synchronous protocol has no good place to wait for.
+            # Counting the connected peers' own bitfields gives the same
+            # quantity from data already in hand: how many peers hold each
+            # piece. It sees only connected peers rather than everything the
+            # swarm knows of, which is a smaller sample of the same thing.
+            availability = [0] * total
+            for peer in peer_infos:
+                try:
+                    bits = peer.pieces
+                except Exception:
+                    continue
+                for index in range(min(total, len(bits))):
+                    if bits[index]:
+                        availability[index] += 1
+
+        rare = (
+            _bucketise(availability, buckets, lambda values: min(min(values), 255))
+            if any(availability)
+            else []
+        )
+
+        # qBittorrent's "Availability: 1.603" — how many whole copies the swarm
+        # holds between it. libtorrent's own figure is preferred; when it is
+        # not reporting one, the same quantity is derived from the availability
+        # counted above, so the number never sits at zero beside a bar that
+        # plainly has data in it.
+        copies = max(0.0, float(status.distributed_copies))
+        if copies == 0.0 and any(availability):
+            floor = min(availability)
+            beyond = sum(1 for count in availability if count > floor)
+            copies = floor + beyond / len(availability)
+
+        out = {
+            "numPieces": total,
+            "pieceLength": info.piece_length(),
+            "buckets": buckets,
+            "have": base64.b64encode(bytes(held)).decode("ascii"),
+            "availability": base64.b64encode(bytes(rare)).decode("ascii") if rare else None,
+            "distributedCopies": copies,
+            "haveCount": int(status.num_pieces),
+        }
+
+        if params.get("peers"):
+            peers = []
+            for peer in peer_infos:
+                try:
+                    bits = list(peer.pieces)
+                except Exception:
+                    continue
+                peers.append(
+                    {
+                        "address": f"{peer.ip[0]}:{peer.ip[1]}",
+                        "client": _text(peer.client),
+                        # Per peer the useful reduction is "any", not "all":
+                        # this bar answers "where could I get pieces from", and
+                        # a peer holding part of a bucket can still serve it.
+                        "have": base64.b64encode(
+                            bytes(_bucketise(bits, buckets, lambda values: 1 if any(values) else 0))
+                        ).decode("ascii"),
+                        "progress": peer.progress,
+                    }
+                )
+            out["peers"] = peers
+
+        return out
+
+    def op_rate_limits(self, params):
+        """
+        Set the session's global rate limits, in bytes per second.
+
+        Applied to the running session rather than at startup, because the
+        point of a schedule is to change the limit at a particular hour — a
+        setting that only took effect on restart could not do that at all.
+
+        libtorrent takes 0 for unlimited; the caller's -1 means the same thing,
+        so both map onto 0 here. Negative values other than -1 would be a
+        caller bug, and clamping them to unlimited is the safe reading: the
+        alternative is a session throttled to a rate nobody asked for.
+        """
+        settings = {}
+        for key, name in (("download", "download_rate_limit"), ("upload", "upload_rate_limit")):
+            if key not in params:
+                continue
+            rate = int(params[key])
+            settings[name] = 0 if rate < 0 else rate
+
+        if settings:
+            self._session.apply_settings(settings)
+
+        current = self._session.get_settings()
+        return {
+            "download": current.get("download_rate_limit", 0),
+            "upload": current.get("upload_rate_limit", 0),
+        }
 
     def op_peers(self, params):
         """
