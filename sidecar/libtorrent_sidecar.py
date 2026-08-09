@@ -180,6 +180,45 @@ class Sidecar:
         except KeyError:
             return None
 
+    def op_trackers(self, params):
+        """Report each tracker and how its last announce went.
+
+        A torrent that finds no peers is otherwise indistinguishable from a
+        swarm that has none: the status says "downloading, 0 peers" either way.
+        libtorrent knows the difference — it has the announce result for every
+        tracker, including why one failed — and this is the only way to see it.
+        """
+        handle = self._handle(params["infoHash"])
+        out = []
+        for entry in handle.trackers():
+            # The per-endpoint records carry the real error for a tracker that
+            # answered differently over IPv4 and IPv6.
+            endpoints = entry.get("endpoints") or []
+            messages = [
+                text
+                for text in (
+                    str(endpoint.get("message") or "") for endpoint in endpoints
+                )
+                if text
+            ]
+            errors = [
+                str(endpoint.get("last_error") or "")
+                for endpoint in endpoints
+                if endpoint.get("last_error")
+            ]
+
+            out.append({
+                "url": entry.get("url"),
+                "tier": entry.get("tier"),
+                "fails": entry.get("fails"),
+                "verified": bool(entry.get("verified")),
+                "updating": bool(entry.get("updating")),
+                "message": str(entry.get("message") or "") or (messages[0] if messages else ""),
+                "lastError": str(entry.get("last_error") or "") or (errors[0] if errors else ""),
+                "nextAnnounce": str(entry.get("next_announce") or ""),
+            })
+        return {"trackers": out}
+
     def op_peers(self, params):
         """Report per-peer detail for one torrent."""
         handle = self._handle(params["infoHash"])
