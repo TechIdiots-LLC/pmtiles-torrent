@@ -82,6 +82,41 @@ PEER_FLAGS = (
 )
 
 
+ZERO_HASH = "0" * 40
+
+
+def _identify(atp):
+    """
+    The v1 infohash of a torrent that has not been added yet.
+
+    Resume files are named by it, so it has to be readable from whatever the
+    caller supplied, before the session has seen either form.
+
+    The metadata is asked first, because `info_hashes` is only filled in for
+    params parsed from a magnet. With a .torrent it reads as forty zeros —
+    which is a perfectly good name for a file that will never exist, so the
+    lookup silently missed and every start re-hashed the whole store.
+    """
+    info = getattr(atp, "ti", None)
+    if info is not None:
+        try:
+            value = str(info.info_hash())
+            if value and value != ZERO_HASH:
+                return value
+        except Exception:
+            pass
+
+    for attribute in ("info_hashes", "info_hash"):
+        try:
+            holder = getattr(atp, attribute)
+            value = str(getattr(holder, "v1", holder))
+            if value and value != ZERO_HASH:
+                return value
+        except Exception:
+            continue
+    return None
+
+
 def _bucketise(values, buckets, reduce_fn):
     """
     Reduces a per-piece sequence to a fixed number of buckets.
@@ -203,6 +238,28 @@ class Sidecar:
         else:
             atp = lt.parse_magnet_uri(params["magnet"])
 
+        # Resume data skips re-hashing a store that is already on disk, which
+        # for an 800 GB archive is the difference between seconds and half an
+        # hour — every single start.
+        #
+        # Found by the torrent's own infohash rather than one the caller had to
+        # remember to send. It did rely on the caller, nothing sent it, so the
+        # lookup was always for None and every restart re-checked everything.
+        resume = self._read_resume(params.get("infoHash") or _identify(atp))
+        if resume:
+            restored = lt.read_resume_data(resume)
+            # Resume data does not carry the metadata, so a .torrent add keeps
+            # the metainfo it already parsed. Without this a resumed torrent
+            # has no file list until it fetches one over BEP 9 — from a swarm,
+            # for a file already on the disk.
+            if atp.ti is not None:
+                restored.ti = atp.ti
+            atp = restored
+
+        # Applied after the resume swap, not before: read_resume_data returns a
+        # fresh params object, so anything set earlier was thrown away. Cache
+        # mode losing its file priorities that way meant a resumed cache-mode
+        # archive quietly began downloading all of it.
         atp.save_path = save_path
 
         # Cache mode joins the swarm without committing the disk to a full
@@ -223,13 +280,6 @@ class Sidecar:
 
         if params.get("paused"):
             atp.flags |= lt.torrent_flags.paused
-
-        # Resume data skips re-hashing an existing store, which on a large
-        # archive is the difference between seconds and many minutes.
-        resume = self._read_resume(params.get("infoHash"))
-        if resume:
-            atp = lt.read_resume_data(resume)
-            atp.save_path = save_path
 
         handle = self._session.add_torrent(atp)
 

@@ -161,5 +161,51 @@ class PieceFields(unittest.TestCase):
                 hasattr(sidecar.lt.torrent_handle, name), f"torrent_handle.{name} is missing"
             )
         self.assertTrue(hasattr(sidecar.lt.peer_info, "pieces"))
+class IdentifyingATorrent(unittest.TestCase):
+    """Naming resume files, which is what makes a restart skip re-hashing."""
+
+    @staticmethod
+    def _torrent(work):
+        data = os.path.join(work, "demo.bin")
+        with open(data, "wb") as fh:
+            fh.write(os.urandom(2 * 1024 * 1024))
+        storage = sidecar.lt.file_storage()
+        sidecar.lt.add_files(storage, data)
+        creator = sidecar.lt.create_torrent(storage, 1 << 20)
+        sidecar.lt.set_piece_hashes(creator, os.path.dirname(data))
+        return sidecar.lt.torrent_info(
+            sidecar.lt.bdecode(sidecar.lt.bencode(creator.generate()))
+        )
+
+    def test_reads_the_hash_from_metadata(self):
+        # The bug: `info_hashes` is only filled in for params parsed from a
+        # magnet. With a .torrent it reads as forty zeros — a perfectly good
+        # name for a file that will never exist, so the resume lookup missed
+        # every time and every restart re-hashed the whole store.
+        import tempfile
+
+        work = tempfile.mkdtemp()
+        info = self._torrent(work)
+        params = sidecar.lt.add_torrent_params()
+        params.ti = info
+
+        self.assertEqual(sidecar._identify(params), str(info.info_hash()))
+        self.assertNotEqual(sidecar._identify(params), sidecar.ZERO_HASH)
+
+    def test_reads_the_hash_from_a_magnet(self):
+        params = sidecar.lt.parse_magnet_uri("magnet:?xt=urn:btih:" + "b" * 40)
+        self.assertEqual(sidecar._identify(params), "b" * 40)
+
+    def test_answers_nothing_when_there_is_nothing_to_read(self):
+        # Better than a name made of zeros, which every torrent would share.
+        self.assertIsNone(sidecar._identify(sidecar.lt.add_torrent_params()))
+
+    def test_a_resume_path_needs_a_hash(self):
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._resume_dir = "/tmp/resume"
+        self.assertIsNone(instance._resume_path(None))
+        self.assertTrue(instance._resume_path("a" * 40).endswith("a" * 40 + ".resume"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
