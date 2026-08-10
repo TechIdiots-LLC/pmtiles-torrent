@@ -119,9 +119,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version-check.outputs.version }}
         run: |
-          NOTES="Published to npm as pmtiles-torrent@$VERSION"
+          # The release notes are the changelog section for this version.
+          #
+          # Same extraction tileserver-gl-wdb and maplibre-maui-ac use (awk
+          # from the matching "## <version>" heading to the next one), so a
+          # reader gets what changed rather than a line saying it was
+          # published. Those repositories reach GitHub through
+          # ncipollo/release-action; this uses the gh CLI already installed on
+          # the runner, which needs no third-party action to be trusted.
+          awk -v ver="## $VERSION" '
+            BEGIN { p = 0 }
+            $0 == ver { p = 1; next }
+            /^## / && p == 1 { exit }
+            p == 1 { print }
+          ' CHANGELOG.md > release-notes.md
+
+          # A version with no section is a mistake worth seeing in the release
+          # rather than a reason to fail after the package is already on npm.
+          if [ ! -s release-notes.md ]; then
+            echo "No changelog section for $VERSION." > release-notes.md
+          fi
+          cat release-notes.md
+
           FLAGS=""
           case "$VERSION" in
             *-*) FLAGS="--prerelease" ;;
           esac
-          gh release create "v$VERSION" --title "v$VERSION" --notes "$NOTES" $FLAGS
+          gh release create "v$VERSION" --title "v$VERSION" --notes-file release-notes.md $FLAGS
