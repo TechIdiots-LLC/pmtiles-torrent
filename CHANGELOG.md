@@ -7,6 +7,14 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.3.1
+### 🐞 Bug fixes
+- **A cache-mode torrent no longer reports 100% while holding nothing.** libtorrent's `progress`
+  is a fraction of what a torrent *wants*, and cache mode wants nothing — so it answers 1.0, and
+  an archive that had fetched none of its own bytes read as complete. The fraction actually held
+  is reported instead, which is the same quantity the piece view already draws. The same reasoning
+  was already applied to `size` a release ago; `progress` was missed.
+
 ## 0.3.0
 ### 🐞 Bug fixes
 - **Resume data is found again, so a restart no longer re-hashes the whole store.** It was looked

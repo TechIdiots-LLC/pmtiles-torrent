@@ -725,12 +725,22 @@ class Sidecar:
         else:
             state = STATE_MAP.get(s.state, "stalled")
 
+        # `progress` is a fraction of what the torrent *wants*, and cache mode
+        # wants nothing — so libtorrent reports 1.0, and an archive holding
+        # none of its own bytes reads as 100% complete. The fraction of the
+        # archive actually held is the honest answer, and is the same quantity
+        # the piece view already draws.
+        progress = s.progress
+        if cache_mode:
+            total_pieces = handle.torrent_file().num_pieces()
+            progress = (s.num_pieces / total_pieces) if total_pieces else 0.0
+
         return {
             "infoHash": str(handle.info_hash()),
             "name": s.name,
             # total_wanted is zero in cache mode, so report the real size.
             "size": handle.torrent_file().total_size() if has_metadata else s.total_wanted,
-            "progress": s.progress,
+            "progress": progress,
             "state": state,
             # Connected clients, not swarm size — and never this one, since a
             # client is not its own peer. So a fully seeded archive nobody is

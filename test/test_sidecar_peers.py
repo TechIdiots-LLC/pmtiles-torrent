@@ -207,5 +207,106 @@ class IdentifyingATorrent(unittest.TestCase):
         self.assertTrue(instance._resume_path("a" * 40).endswith("a" * 40 + ".resume"))
 
 
+class FakeInfo:
+    """Torrent metadata, as much of it as _status reads."""
+
+    def __init__(self, pieces=1000, size=137_000_000_000):
+        self._pieces = pieces
+        self._size = size
+
+    def num_pieces(self):
+        return self._pieces
+
+    def total_size(self):
+        return self._size
+
+
+class FakeStatus:
+    """A torrent_status carrying only what _status reads."""
+
+    def __init__(self, **fields):
+        self.has_metadata = True
+        self.name = "planet-260803.osm.pbf"
+        self.total_wanted = 0
+        self.progress = 1.0
+        self.num_pieces = 0
+        self.state = None
+        self.num_peers = 0
+        self.num_seeds = 0
+        self.num_complete = -1
+        self.num_incomplete = -1
+        self.download_payload_rate = 0
+        self.upload_payload_rate = 0
+        self.total_done = 0
+        self.all_time_upload = 0
+        self.all_time_download = 0
+        self.distributed_copies = 0.0
+        self.save_path = "/tmp"
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+    def __getattr__(self, name):
+        # Anything else _status reads is a counter this test does not care
+        # about. Answering zero keeps the fake from having to track every
+        # field the real status grows, which is not what is under test here.
+        return 0
+
+
+class FakeHandle:
+    """A torrent_handle answering _status."""
+
+    def __init__(self, status, info=None):
+        self._status = status
+        self._info = info or FakeInfo()
+
+    def status(self):
+        return self._status
+
+    def flags(self):
+        return 0
+
+    def info_hash(self):
+        return "a" * 40
+
+    def torrent_file(self):
+        return self._info
+
+
+class CacheModeProgress(unittest.TestCase):
+    """
+    The bug this exists for: `progress` is a fraction of what the torrent
+    *wants*, and cache mode wants nothing — so libtorrent reports 1.0 and an
+    archive holding none of its own bytes reads as 100% complete. A subscription
+    asking for a mirror that silently arrived as a cache therefore looked
+    finished the moment it was added.
+    """
+
+    def _progress(self, **status):
+        engine = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        return engine._status(FakeHandle(FakeStatus(**status)))["progress"]
+
+    def test_cache_mode_reports_what_it_actually_holds(self):
+        self.assertEqual(self._progress(total_wanted=0, num_pieces=0), 0.0)
+        self.assertEqual(self._progress(total_wanted=0, num_pieces=250), 0.25)
+        self.assertEqual(self._progress(total_wanted=0, num_pieces=1000), 1.0)
+
+    def test_cache_mode_says_cache_rather_than_paused(self):
+        self.assertEqual(
+            self._state(total_wanted=0),
+            "cache",
+            "a torrent fetching nothing on purpose is not a stalled one",
+        )
+
+    def test_mirror_mode_is_left_alone(self):
+        # total_wanted is non-zero, so libtorrent's own figure is the answer.
+        self.assertEqual(
+            self._progress(total_wanted=137_000_000_000, progress=0.42), 0.42
+        )
+
+    def _state(self, **status):
+        engine = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        return engine._status(FakeHandle(FakeStatus(**status)))["state"]
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
