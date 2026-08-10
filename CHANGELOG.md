@@ -2,6 +2,13 @@
 
 ## master
 ### ✨ Features and improvements
+- _...Add new stuff here..._
+
+### 🐞 Bug fixes
+- _...Add new stuff here..._
+
+## 0.2.0
+### ✨ Features and improvements
 - **Status reports the whole swarm, not only what is connected.** `peers` and `seeds` count remote
   clients this node is talking to — never itself, since a client is not its own peer — so a fully
   seeded archive nobody is currently downloading reads zero peers, which is correct and reads like
@@ -20,6 +27,9 @@
 - **`rate_limits`**, setting the session's global download and upload rates on a running session.
   Applied live rather than at startup, since a setting that only took effect on restart could not
   drive a schedule.
+- Document which WebTorrent major version to use. webtorrent 3 needs Node 22 but works as
+  installed; webtorrent 2 runs on older Node but needs a `uint8-util` override, without which
+  every magnet add throws.
 
 ### 🐞 Bug fixes
 - **The libtorrent sidecar reports peers again.** `peer_info.utp_socket` is in the C++ header but
@@ -36,14 +46,6 @@
   parent was already shutting it down deliberately; a stack trace at the end of a clean stop reads
   as a crash and buries the lines that say what actually happened. A closed pipe is treated the
   same way, for the same reason.
-
-### ✨ Features and improvements
-- Document which WebTorrent major version to use. webtorrent 3 needs Node 22 but works as
-  installed; webtorrent 2 runs on older Node but needs a `uint8-util` override, without which
-  every magnet add throws.
-
-### 🐞 Bug fixes
-- _...Add new stuff here..._
 
 ## 0.1.1
 
