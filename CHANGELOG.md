@@ -5,6 +5,10 @@
 - _...Add new stuff here..._
 
 ### 🐞 Bug fixes
+- _...Add new stuff here..._
+
+## 0.3.0
+### 🐞 Bug fixes
 - **Resume data is found again, so a restart no longer re-hashes the whole store.** It was looked
   up by an infohash the caller had to supply, and nothing supplied one — but even with the lookup
   keyed off the torrent itself, `add_torrent_params.info_hashes` is only populated for params
