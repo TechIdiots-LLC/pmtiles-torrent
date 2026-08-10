@@ -7,6 +7,16 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.3.2
+### 🐞 Bug fixes
+- **Resume data is written for an archive that has only been seeding.** Saving asked
+  `need_save_resume_data()` first, which answers "has anything changed since the last save"
+  rather than "does a resume file exist" — and an archive that has sat there seeding since it
+  was added answers no, for ever. So nothing was ever written for exactly the torrents that
+  most need it, and each one re-hashed its whole store on every start: half an hour of disk
+  for 800 GB before it serves anything. Saving is now unconditional, which costs a few
+  kilobytes per torrent.
+
 ## 0.3.1
 ### 🐞 Bug fixes
 - **A cache-mode torrent no longer reports 100% while holding nothing.** libtorrent's `progress`

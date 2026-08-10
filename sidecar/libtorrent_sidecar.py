@@ -670,9 +670,16 @@ class Sidecar:
         )
         saved = 0
         for handle in handles:
-            if handle.need_save_resume_data():
-                handle.save_resume_data()
-                saved += 1
+            # Asked unconditionally.
+            #
+            # This used to ask need_save_resume_data() first, which reports
+            # whether anything has changed since the last save — not whether a
+            # resume file exists. A torrent that has sat there seeding since it
+            # was added answers "nothing has changed", so nothing was ever
+            # written for it, and it re-hashed its whole store on every start.
+            # The saving is a few kilobytes; the checking is half an hour.
+            handle.save_resume_data()
+            saved += 1
         # Alerts carry the actual data; drain briefly to collect them.
         deadline = time.time() + 5
         while saved > 0 and time.time() < deadline:
