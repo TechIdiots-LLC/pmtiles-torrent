@@ -682,8 +682,18 @@ class Sidecar:
             "size": handle.torrent_file().total_size() if has_metadata else s.total_wanted,
             "progress": s.progress,
             "state": state,
+            # Connected clients, not swarm size — and never this one, since a
+            # client is not its own peer. So a fully seeded archive nobody is
+            # currently downloading reads 0 peers, which is correct and says
+            # nothing is wrong.
             "peers": max(0, s.num_peers - s.num_seeds),
             "seeds": s.num_seeds,
+            # What the tracker last said the whole swarm holds, this node
+            # included. It is the difference between "nobody wants this" and
+            # "nobody knows about it", which the connected counts alone cannot
+            # tell apart. -1 until a tracker has answered a scrape.
+            "swarmSeeds": s.num_complete,
+            "swarmPeers": s.num_incomplete,
             "downloadSpeed": s.download_rate,
             "uploadSpeed": s.upload_rate,
             "downloaded": s.total_done,

@@ -2,6 +2,12 @@
 
 ## master
 ### ✨ Features and improvements
+- **Status reports the whole swarm, not only what is connected.** `peers` and `seeds` count remote
+  clients this node is talking to — never itself, since a client is not its own peer — so a fully
+  seeded archive nobody is currently downloading reads zero peers, which is correct and reads like
+  a fault. `swarmSeeds` and `swarmPeers` carry what the tracker last reported for the swarm as a
+  whole, this node included, which is what tells "nobody wants this" apart from "nobody knows about
+  it". Both are -1 until a tracker has answered a scrape.
 - **`pieces`**, reporting which pieces a torrent holds, how rare each one is across the swarm, and
   what each connected peer has. Reduced to a requested number of buckets before it is returned,
   because full resolution does not survive the trip: a 698 GiB archive at 4 MiB pieces is 178,000
