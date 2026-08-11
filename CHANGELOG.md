@@ -7,6 +7,21 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.4.0
+### ✨ Features and improvements
+- **A torrent joined by magnet can hand back its metainfo**, which is what a client's
+  "export .torrent" does. Once BEP 9 has delivered the info dictionary the node holds
+  everything a `.torrent` contains, whether or not a byte of the archive has arrived — but
+  nothing could ask for it, so a node that joined by magnet had no `.torrent` to publish. Its
+  subscribers therefore also joined by magnet, and a magnet carrying no trackers has only the
+  DHT to find a first peer with: minutes of waiting per archive rather than none. libtorrent
+  could always do this; nothing had asked it to.
+
+  Rebuilt from the parsed info rather than kept as received, since the received form is not
+  retained. Verified against libtorrent that the round trip is byte-identical and preserves the
+  infohash and the hybrid flags — and the caller checks the infohash anyway, so a rebuild that
+  lost something cannot be published as though it were the original.
+
 ## 0.3.2
 ### 🐞 Bug fixes
 - **Resume data is written for an archive that has only been seeding.** Saving asked

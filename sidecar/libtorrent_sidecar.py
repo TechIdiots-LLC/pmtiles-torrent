@@ -591,6 +591,36 @@ class Sidecar:
             "format": fmt,
         }
 
+    def op_metadata(self, params):
+        """
+        Hand back the metainfo of a torrent joined by magnet.
+
+        The same thing a torrent client's "export .torrent" does, and available
+        for the same reason: once BEP 9 has delivered the info dictionary, the
+        node holds everything a .torrent file contains, whether or not a single
+        byte of the archive has arrived.
+
+        This is what lets a magnet stop being a magnet. Without it a node that
+        joined by magnet has no .torrent to serve, so every subscriber that
+        follows its feed also joins by magnet — and a magnet carrying no
+        trackers has nothing but the DHT to find its first peer with, which is
+        minutes of waiting per archive rather than none.
+
+        Rebuilt from the parsed info rather than kept as received, because the
+        received form is not retained anywhere. The caller checks that the
+        infohash still matches and discards it if not, so a rebuild that lost
+        something cannot be published as though it were the original.
+        """
+        handle = self._handle(params["infoHash"])
+        if not handle.status().has_metadata:
+            raise RuntimeError("metadata has not arrived yet")
+
+        info = handle.torrent_file()
+        creator = lt.create_torrent(info)
+        raw = lt.bencode(creator.generate())
+
+        return {"torrentFile": base64.b64encode(raw).decode()}
+
     def op_read_piece(self, params):
         """
         Read one piece, prioritising it ahead of everything else.

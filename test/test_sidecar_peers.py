@@ -308,5 +308,68 @@ class CacheModeProgress(unittest.TestCase):
         return engine._status(FakeHandle(FakeStatus(**status)))["state"]
 
 
+class ExportingMetadata(unittest.TestCase):
+    """
+    The gap this exists for: nothing could hand back the metainfo of a torrent
+    joined by magnet, so a node that joined one had no .torrent to publish. Its
+    subscribers therefore also joined by magnet, and a magnet carrying no
+    trackers has only the DHT to find a first peer with. libtorrent could always
+    do this — the same thing a client's "export .torrent" does — and nothing had
+    asked it to.
+    """
+
+    def _torrent(self):
+        import os
+        import tempfile
+
+        directory = tempfile.mkdtemp()
+        target = os.path.join(directory, "planet.pmtiles")
+        with open(target, "wb") as handle:
+            handle.write(os.urandom(200000))
+
+        storage = sidecar.lt.file_storage()
+        sidecar.lt.add_files(storage, target)
+        creator = sidecar.lt.create_torrent(storage, 16384, flags=0)
+        sidecar.lt.set_piece_hashes(creator, os.path.dirname(target))
+        return sidecar.lt.torrent_info(creator.generate())
+
+    def test_hands_back_bytes_that_parse_to_the_same_torrent(self):
+        import base64
+
+        info = self._torrent()
+
+        class Handle:
+            def status(self):
+                return FakeStatus(has_metadata=True)
+
+            def torrent_file(self):
+                return info
+
+        engine = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        engine._handle = lambda _hash: Handle()
+
+        result = engine.op_metadata({"infoHash": str(info.info_hash())})
+        rebuilt = sidecar.lt.torrent_info(
+            sidecar.lt.bdecode(base64.b64decode(result["torrentFile"]))
+        )
+
+        # The caller checks this and discards the bytes if it fails, so a
+        # rebuild that lost something cannot be published as the original.
+        self.assertEqual(str(rebuilt.info_hash()), str(info.info_hash()))
+        self.assertEqual(rebuilt.name(), info.name())
+        self.assertEqual(rebuilt.total_size(), info.total_size())
+
+    def test_refuses_before_the_metainfo_has_arrived(self):
+        class Handle:
+            def status(self):
+                return FakeStatus(has_metadata=False)
+
+        engine = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        engine._handle = lambda _hash: Handle()
+
+        with self.assertRaises(RuntimeError):
+            engine.op_metadata({"infoHash": "a" * 40})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
