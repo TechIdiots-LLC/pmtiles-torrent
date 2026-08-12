@@ -1,6 +1,6 @@
 {
   "name": "pmtiles-torrent",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Serve a PMTiles archive from a BitTorrent swarm — a torrent-backed Source for the pmtiles package",
   "type": "module",
   "main": "dist/cjs/index.cjs",

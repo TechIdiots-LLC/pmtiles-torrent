@@ -7,6 +7,31 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.4.3
+### ✨ Features and improvements
+- **[examples/maplibre-gl-js](examples/maplibre-gl-js)** — a browser page that reads tiles out of
+  an archive it is downloading from the swarm, with no tile server involved. The integration point
+  is `addProtocol`: it claims a URL scheme, which is what lets an ordinary-looking style entry route
+  into this package, and it is the same mechanism `pmtiles://` uses.
+
+  Two things it demonstrates that are easy to miss. `TorrentSource` already implements the pmtiles
+  `Source` interface — `getBytes()` and `getKey()` — so the `pmtiles` library reads through a
+  swarm without knowing anything about BitTorrent, and nothing in the path is tile-aware. And the
+  TileJSON is **derived from the archive** rather than fetched: the header carries the zoom range,
+  bounds and centre, the metadata carries the name and vector layers, so no server is needed to
+  describe a map, only to host bytes.
+
+  **This package already runs in a browser unmodified.** It has no runtime dependencies, and every
+  Node-only path in the WebTorrent engine is gated behind `resumePath` — leave it unset and
+  `node:fs`, `node:path` and `Buffer` are never reached.
+
+  The example's README is explicit about what a browser cannot do, since those are platform limits
+  rather than gaps here: WebRTC only, so a magnet needs a `wss://` tracker or a page will find no
+  peers however healthy the swarm is elsewhere; a cold tile costs a whole piece, so at 4 MiB
+  pieces one 40 KB tile means moving 4 MiB; and nothing persists between visits. The honest use is
+  bandwidth rather than latency — every piece a viewer pulls is one they seed back, so a region
+  many people view at once gets cheaper to distribute as the audience grows.
+
 ## 0.4.2
 ### 🐞 Bug fixes
 - **A hybrid torrent is now named by its v1 infohash, which is the name everything else knows it
