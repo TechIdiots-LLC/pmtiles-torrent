@@ -7,6 +7,22 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.4.1
+### 🐞 Bug fixes
+- **An archive whose data is already on disk no longer waits to be hashed a second time.** The
+  sidecar's add now understands `seedOnly`: the caller's statement that the store is complete and
+  was verified on the way in, which for an archive created from a local file it was — the file
+  had just been read end to end to produce the torrent. Without it libtorrent re-hashed the whole
+  archive before it would seed a byte. For an 81 GiB planet build that is roughly a quarter of an
+  hour of disk to rediscover what had been measured moments earlier, and for the whole of it the
+  archive reads as 0% and serves nobody, which looks like a failed import rather than like work in
+  progress.
+
+  This is libtorrent's `seed_mode`, and it stays a claim rather than an assumption: it is set only
+  when the caller makes it, never for cache mode, which by definition holds no complete copy. If
+  the claim turns out to be wrong libtorrent verifies the piece before sending it and falls back
+  to checking, so the cost of being wrong is a re-check rather than bad data on the wire.
+
 ## 0.4.0
 ### ✨ Features and improvements
 - **A torrent joined by magnet can hand back its metainfo**, which is what a client's

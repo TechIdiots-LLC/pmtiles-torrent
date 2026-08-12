@@ -11,11 +11,15 @@ Run with `python test/test_sidecar_peers.py` (stdlib unittest, no pytest).
 
 import os
 import sys
+import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sidecar"))
 
 import libtorrent_sidecar as sidecar  # noqa: E402
+
+MAGNET = "magnet:?xt=urn:btih:" + "a" * 40
 
 
 class FakePeer:
@@ -369,6 +373,90 @@ class ExportingMetadata(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             engine.op_metadata({"infoHash": "a" * 40})
+
+
+class SeedModeOnAdd(unittest.TestCase):
+    """
+    The gap this exists for: an archive created from a local file has just been
+    read end to end to produce its torrent, and adding it without saying so
+    made libtorrent hash the whole thing again before it would seed a byte. For
+    an 81 GiB planet build that is a quarter of an hour of disk to rediscover
+    what was measured moments earlier, during which it reads as 0% and serves
+    nobody.
+
+    Driven through the real op_add against the real bindings, so it is the flag
+    libtorrent ends up with that is asserted, not a restatement of the branch.
+    """
+
+    def add(self, params):
+        """Runs the real op_add against a session that records what it got."""
+
+        class Handle:
+            def info_hash(self):
+                return "b" * 40
+
+            # A cache-mode magnet has no metadata at add time, so op_add starts
+            # a thread to set file priorities once it arrives. Answering it
+            # lets that thread finish instead of raising into the test output.
+            def has_metadata(self):
+                return True
+
+            def torrent_file(self):
+                class Info:
+                    def num_files(self):
+                        return 1
+
+                return Info()
+
+            def prioritize_files(self, priorities):
+                self.priorities = priorities
+
+        class Session:
+            def __init__(self):
+                self.atp = None
+
+            def add_torrent(self, atp):
+                self.atp = atp
+                return Handle()
+
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._session = Session()
+        instance._lock = threading.Lock()
+        instance._handles = {}
+        # No resume data: a resumed add takes a different path, and the point
+        # here is the first one.
+        instance._read_resume = lambda info_hash: None
+
+        with tempfile.TemporaryDirectory() as save_path:
+            sidecar.Sidecar.op_add(
+                instance,
+                {"magnet": MAGNET, "savePath": save_path, **params},
+            )
+        return instance._session.atp
+
+    def test_claims_the_data_when_the_caller_says_it_is_there(self):
+        atp = self.add({"seedOnly": True})
+        self.assertTrue(atp.flags & sidecar.lt.torrent_flags.seed_mode)
+
+    def test_does_not_claim_it_otherwise(self):
+        # Claiming data that is not there would have libtorrent offer pieces it
+        # cannot produce, so this must stay off unless it was asked for.
+        atp = self.add({})
+        self.assertFalse(atp.flags & sidecar.lt.torrent_flags.seed_mode)
+
+    def test_leaves_cache_mode_alone(self):
+        # The two are set in the same stretch of op_add, and cache mode clears
+        # flags. An archive that only caches has no complete data to claim.
+        atp = self.add({"mode": "cache"})
+        self.assertFalse(atp.flags & sidecar.lt.torrent_flags.seed_mode)
+        self.assertFalse(atp.flags & sidecar.lt.torrent_flags.auto_managed)
+
+    def test_still_honours_paused(self):
+        # Set after seed_mode, and neither may eat the other: an archive added
+        # paused must stay paused even though its data is all present.
+        atp = self.add({"seedOnly": True, "paused": True})
+        self.assertTrue(atp.flags & sidecar.lt.torrent_flags.seed_mode)
+        self.assertTrue(atp.flags & sidecar.lt.torrent_flags.paused)
 
 
 if __name__ == "__main__":

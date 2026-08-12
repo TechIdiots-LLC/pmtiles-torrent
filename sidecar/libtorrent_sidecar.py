@@ -278,6 +278,21 @@ class Sidecar:
             atp.flags &= ~lt.torrent_flags.auto_managed
             atp.flags &= ~lt.torrent_flags.paused
 
+        # The data is already here, and was hashed on the way in.
+        #
+        # An archive created from a local file has just been read end to end to
+        # produce the torrent. Adding it without saying so makes libtorrent
+        # hash the whole thing a second time before it will seed a byte — for
+        # an 81 GiB planet build that is a quarter of an hour of disk to
+        # rediscover what was measured a moment earlier, during which the
+        # archive reads as 0% and serves nobody.
+        #
+        # seed_mode is exactly this claim. libtorrent still verifies a piece
+        # before sending it if a peer's request fails, so a claim that turns
+        # out to be wrong costs a re-check rather than bad data.
+        if params.get("seedOnly"):
+            atp.flags |= lt.torrent_flags.seed_mode
+
         if params.get("paused"):
             atp.flags |= lt.torrent_flags.paused
 
