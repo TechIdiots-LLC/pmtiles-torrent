@@ -293,6 +293,24 @@ creates the torrent includes it (`mktorrent -w https://…`). The one setting wo
 If you publish archives over HTTP already, adding a web seed to their torrents is the single
 largest improvement available here.
 
+## In a browser
+
+`examples/maplibre-gl-js` is a page that resolves tiles out of an archive it is downloading from
+the swarm, with no tile server involved. It runs this package unmodified: there are no runtime
+dependencies, and every Node-only path in the WebTorrent engine is gated behind `resumePath`, so
+leaving that unset keeps `node:fs`, `node:path` and `Buffer` out of reach.
+
+The integration point is `addProtocol` — it claims a URL scheme, so a normal-looking style entry
+routes into your code, which is the same mechanism `pmtiles://` uses. And `TorrentSource` already
+implements the pmtiles `Source` interface, `getBytes()` and `getKey()`, so the `pmtiles` library
+reads through a swarm without knowing anything about BitTorrent.
+
+Worth reading the example's own README before judging the numbers: a browser speaks WebRTC only
+and cannot reach TCP or uTP peers at all, so a magnet without a `wss://` tracker finds nobody
+however healthy that swarm is elsewhere. And a cold tile costs a whole piece — 4 MiB moved to
+deliver 40 KB — so the swarm belongs in the background and never in front of a first paint. The
+case for it is bandwidth rather than latency: every piece a viewer pulls is one they seed back.
+
 ## Development
 
 TypeScript source in `src/`, compiled by tsup to ESM, CJS and declarations in `dist/`. Consumers
@@ -301,7 +319,7 @@ install the compiled output, so nothing downstream needs a toolchain.
 ```sh
 npm install
 npm run tsc     # typecheck
-npm test        # 36 tests
+npm test        # the JavaScript suite
 npm run build   # dist/esm, dist/cjs, .d.ts
 ```
 
