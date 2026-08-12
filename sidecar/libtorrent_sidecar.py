@@ -152,6 +152,32 @@ def _identify(atp):
     return _v1_of(atp)
 
 
+def _fraction(values):
+    """
+    How much of a bucket is held, as 0-255.
+
+    A bucket covers many pieces -- a 698 GiB archive at 4 MiB pieces is 178,000
+    of them against a bar a thousand columns wide -- so reducing by `all` meant
+    a column lit only when every piece under it had arrived. At 18% complete,
+    scattered, essentially no column qualified and the bar read as empty. `any`
+    has the opposite fault: one piece in a hundred and seventy-eight lights the
+    whole column.
+
+    A proportion is the honest answer, and it is what makes the bar mean
+    something between 0% and 100%.
+
+    Never rounds a non-empty bucket down to 1: a reader distinguishes the old
+    boolean encoding from this one by whether any value exceeds 1, and a bucket
+    that rounded to 1 would be mistaken for it.
+    """
+    if not values:
+        return 0
+    held = sum(1 for value in values if value)
+    if held == 0:
+        return 0
+    return max(2, round(255 * held / len(values)))
+
+
 def _bucketise(values, buckets, reduce_fn):
     """
     Reduces a per-piece sequence to a fixed number of buckets.
@@ -443,9 +469,9 @@ class Sidecar:
         buckets = max(1, min(buckets, total))
 
         have = list(status.pieces or [])
-        # `have` reduces by minimum too: a bucket is only "complete" when every
+        # `have` reduces to a proportion: a column shows how much of its slice
         # piece in it is, so a nearly-full bar cannot be mistaken for a done one.
-        held = _bucketise(have, buckets, lambda values: 1 if all(values) else 0)
+        held = _bucketise(have, buckets, _fraction)
 
         # Peers are read once, up here, because availability is derived from
         # them when libtorrent will not answer directly.
@@ -516,7 +542,7 @@ class Sidecar:
                         # this bar answers "where could I get pieces from", and
                         # a peer holding part of a bucket can still serve it.
                         "have": base64.b64encode(
-                            bytes(_bucketise(bits, buckets, lambda values: 1 if any(values) else 0))
+                            bytes(_bucketise(bits, buckets, _fraction))
                         ).decode("ascii"),
                         "progress": peer.progress,
                     }

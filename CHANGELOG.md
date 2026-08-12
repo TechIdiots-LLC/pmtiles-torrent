@@ -7,6 +7,21 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.4.4
+### 🐞 Bug fixes
+- **The piece bars only told the truth at 0% and 100%.** A column covers many pieces — 178,000
+  across a bar a thousand wide on a 698 GiB archive — and "held" reduced by `all`, so a column lit
+  only when every piece beneath it had arrived. On an archive 18% downloaded, scattered, no column
+  qualified and the bar read as completely empty while the torrent was plainly working.
+
+  Peer bars had the opposite fault, reducing by `any`: one piece in a hundred and seventy-eight lit
+  the whole column, so a peer holding almost nothing looked like a seed.
+
+  Both now report a **proportion** (0–255), which is the only honest reduction when a column stands
+  for many pieces. A non-empty bucket never rounds below 2, so a reader can tell this encoding from
+  the old booleans by whether any value exceeds 1 — which is how pmtiles-swarm keeps rendering
+  correctly against either.
+
 ## 0.4.3
 ### ✨ Features and improvements
 - **[examples/maplibre-gl-js](examples/maplibre-gl-js)** — a browser page that reads tiles out of

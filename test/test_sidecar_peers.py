@@ -571,5 +571,42 @@ class HybridTorrentIdentity(unittest.TestCase):
         self.assertEqual(sidecar._identify(atp), self.v1_of(created["torrentFile"]))
 
 
+class BucketProportions(unittest.TestCase):
+    """
+    The bug this exists for: a piece bar that only told the truth at 0% and
+    100%. A bucket covers many pieces -- 178,000 across a bar a thousand wide
+    on a 698 GiB archive -- and reducing by `all` lit a column only when every
+    piece under it had arrived. At 18% complete, scattered, no column
+    qualified and the bar read as empty on a torrent that was plainly
+    downloading.
+    """
+
+    def test_empty_and_full_are_unambiguous(self):
+        self.assertEqual(sidecar._fraction([0, 0, 0, 0]), 0)
+        self.assertEqual(sidecar._fraction([1, 1, 1, 1]), 255)
+
+    def test_a_partly_held_bucket_lands_in_between(self):
+        self.assertEqual(sidecar._fraction([1, 0, 0, 0]), 64)
+        self.assertEqual(sidecar._fraction([1, 1, 0, 0]), 128)
+
+    def test_a_barely_held_bucket_never_rounds_to_one(self):
+        # A reader tells this encoding from the old booleans by whether any
+        # value exceeds 1, so a bucket rounding to 1 would be misread as the
+        # old format and drawn as completely held.
+        self.assertEqual(sidecar._fraction([1] + [0] * 177), 2)
+        self.assertGreater(sidecar._fraction([1] + [0] * 1000), 1)
+
+    def test_an_eighteen_percent_torrent_shows_something(self):
+        # The case from the field: previously every bucket reduced to 0.
+        pieces = [1] * 18 + [0] * 82
+        bars = sidecar._bucketise(pieces, 10, sidecar._fraction)
+        self.assertTrue(any(bars), 'the bar is no longer empty')
+        self.assertEqual(bars[0], 255, 'a fully held slice still reads as full')
+        self.assertEqual(bars[-1], 0, 'and an empty one still reads as empty')
+
+    def test_handles_an_empty_bucket_list(self):
+        self.assertEqual(sidecar._fraction([]), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
