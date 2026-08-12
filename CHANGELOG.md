@@ -7,6 +7,26 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.4.2
+### 🐞 Bug fixes
+- **A hybrid torrent is now named by its v1 infohash, which is the name everything else knows it
+  by.** For a hybrid v1+v2 torrent libtorrent answers `info_hash()` with the *truncated v2* hash,
+  and the sidecar reported that as the torrent's identity — while the catalog that recorded it,
+  the magnet handed to peers and every v1 client in the swarm use the v1 hash. A freshly built
+  archive therefore seeded perfectly well while the node holding it reported an archive its engine
+  had never heard of, served no tile from it, because every lookup arrived under a name the
+  sidecar had not filed it under, and wrote its resume file under that other name too, so every
+  restart re-hashed it.
+
+  Only newly created archives were affected, since creation is where hybrids come from: one
+  archive out of seventeen on the node this was found on. It reads as a single corrupt build
+  rather than as a naming fault, which is what made it hard to see.
+
+  All six places that minted the identity — create, add, info, status, resume writing and the
+  handle lookup — now go through one helper that prefers v1 and falls back to the truncated form
+  for a v2-only torrent, where it is the only name there is. Existing hybrid archives will
+  re-check once as their resume files are rediscovered under the corrected name.
+
 ## 0.4.1
 ### 🐞 Bug fixes
 - **An archive whose data is already on disk no longer waits to be hashed a second time.** The

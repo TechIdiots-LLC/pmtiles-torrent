@@ -9,7 +9,10 @@ reported zero peers — and looked exactly like a swarm nobody was in.
 Run with `python test/test_sidecar_peers.py` (stdlib unittest, no pytest).
 """
 
+import base64
+import hashlib
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -193,7 +196,12 @@ class IdentifyingATorrent(unittest.TestCase):
         params = sidecar.lt.add_torrent_params()
         params.ti = info
 
-        self.assertEqual(sidecar._identify(params), str(info.info_hash()))
+        # Against the v1 hash rather than against `info_hash()`, which this
+        # once compared with. create_torrent defaults to hybrid, and for a
+        # hybrid libtorrent answers `info_hash()` with the truncated v2 hash —
+        # so the old comparison asserted the second bug while testing the
+        # first, and passed because both sides were wrong in the same way.
+        self.assertEqual(sidecar._identify(params), str(info.info_hashes().v1))
         self.assertNotEqual(sidecar._identify(params), sidecar.ZERO_HASH)
 
     def test_reads_the_hash_from_a_magnet(self):
@@ -457,6 +465,110 @@ class SeedModeOnAdd(unittest.TestCase):
         atp = self.add({"seedOnly": True, "paused": True})
         self.assertTrue(atp.flags & sidecar.lt.torrent_flags.seed_mode)
         self.assertTrue(atp.flags & sidecar.lt.torrent_flags.paused)
+
+
+class HybridTorrentIdentity(unittest.TestCase):
+    """
+    The bug this exists for: for a hybrid v1+v2 torrent libtorrent answers
+    `info_hash()` with the *truncated v2* hash, and the sidecar reported that
+    as the torrent's name. Everything else -- the catalog that recorded it, the
+    magnet handed to peers, every v1 client in the swarm -- uses the v1 hash.
+    So a freshly built archive seeded perfectly while the node holding it
+    reported an archive the engine had never heard of, and could serve no tile
+    from it, because every lookup arrived under a name the sidecar had not
+    filed it under.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.work = tempfile.mkdtemp(prefix="hybrid-identity-")
+        data = os.path.join(cls.work, "archive.bin")
+        with open(data, "wb") as handle:
+            handle.write(os.urandom(4 * 1024 * 1024))
+        cls.data = data
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.work, ignore_errors=True)
+
+    def sidecar_instance(self):
+        """A sidecar over a real session, with nowhere to write resume data."""
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._session = sidecar.lt.session(
+            {"listen_interfaces": "127.0.0.1:0", "enable_dht": False}
+        )
+        instance._lock = threading.Lock()
+        instance._handles = {}
+        instance._resume_dir = None
+        return instance
+
+    def v1_of(self, torrent_file):
+        """The v1 infohash the way every other tool computes it."""
+        decoded = sidecar.lt.bdecode(base64.b64decode(torrent_file))
+        return hashlib.sha1(sidecar.lt.bencode(decoded[b"info"])).hexdigest()
+
+    def test_libtorrent_still_answers_with_the_v2_hash(self):
+        # The premise. If a future libtorrent changes its mind about this the
+        # workaround becomes unnecessary, and this is where that shows up.
+        instance = self.sidecar_instance()
+        created = instance.op_create(
+            {"path": self.data, "pieceLength": 1024 * 1024, "format": "hybrid"}
+        )
+        info = sidecar.lt.torrent_info(
+            sidecar.lt.bdecode(base64.b64decode(created["torrentFile"]))
+        )
+        self.assertNotEqual(
+            str(info.info_hash()),
+            self.v1_of(created["torrentFile"]),
+            "libtorrent no longer truncates v2 here; _v1_of can be simplified",
+        )
+
+    def test_creating_names_it_by_v1(self):
+        instance = self.sidecar_instance()
+        created = instance.op_create(
+            {"path": self.data, "pieceLength": 1024 * 1024, "format": "hybrid"}
+        )
+        self.assertEqual(created["format"], "hybrid")
+        self.assertEqual(created["infoHash"], self.v1_of(created["torrentFile"]))
+
+    def test_adding_listing_and_lookup_all_agree(self):
+        # The three that have to match: what the add hands back and is filed
+        # under, what a listing reports, and what a tile read looks up by.
+        instance = self.sidecar_instance()
+        created = instance.op_create(
+            {"path": self.data, "pieceLength": 1024 * 1024, "format": "hybrid"}
+        )
+        v1 = self.v1_of(created["torrentFile"])
+
+        added = instance.op_add(
+            {"torrentFile": created["torrentFile"], "savePath": self.work, "seedOnly": True}
+        )
+        self.assertEqual(added["infoHash"], v1)
+        self.assertEqual(instance.op_list({})[0]["infoHash"], v1)
+        self.assertIsNotNone(instance._handle(v1))
+
+    def test_a_v1_only_torrent_is_unaffected(self):
+        # The other half of the swarm: a v1 torrent has no v2 hash to prefer,
+        # and must keep answering exactly as it did.
+        instance = self.sidecar_instance()
+        created = instance.op_create(
+            {"path": self.data, "pieceLength": 1024 * 1024, "format": "v1"}
+        )
+        self.assertEqual(created["infoHash"], self.v1_of(created["torrentFile"]))
+
+    def test_identify_finds_the_v1_name_before_the_add(self):
+        # Resume files are named by this, and it is read from add params rather
+        # than from a live handle. Naming a hybrid's resume file after the v2
+        # hash meant nothing ever found it again and every start re-hashed.
+        instance = self.sidecar_instance()
+        created = instance.op_create(
+            {"path": self.data, "pieceLength": 1024 * 1024, "format": "hybrid"}
+        )
+        atp = sidecar.lt.add_torrent_params()
+        atp.ti = sidecar.lt.torrent_info(
+            sidecar.lt.bdecode(base64.b64decode(created["torrentFile"]))
+        )
+        self.assertEqual(sidecar._identify(atp), self.v1_of(created["torrentFile"]))
 
 
 if __name__ == "__main__":

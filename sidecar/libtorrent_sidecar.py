@@ -85,6 +85,52 @@ PEER_FLAGS = (
 ZERO_HASH = "0" * 40
 
 
+def _v1_of(source):
+    """
+    The v1 infohash of a torrent, which is the name everything else knows it by.
+
+    For a **hybrid** v1+v2 torrent libtorrent answers `info_hash()` with the
+    *truncated v2* hash, while the catalog that recorded the torrent, the
+    magnet it hands out and every v1 peer in the swarm use the v1 hash. Keying
+    on what libtorrent volunteered therefore filed a hybrid archive under a
+    name nothing else used: the archive seeded perfectly well, and the node
+    holding it reported an archive the engine had never heard of and could
+    serve no tile from, because every lookup arrived under the other name.
+
+    Falls back to `info_hash()` for a v2-only torrent, where the truncated form
+    is the only name there is.
+
+    Takes a handle, a torrent_info or an add_torrent_params: `info_hashes` is a
+    method on the first two and a plain attribute on the third, and `has_v1` is
+    a method in some builds and an attribute in others.
+    @param source: Anything carrying infohashes.
+    @return: A hex string, or None if it carries none yet.
+    """
+    holder = getattr(source, "info_hashes", None)
+    if holder is not None:
+        try:
+            hashes = holder() if callable(holder) else holder
+            has_v1 = getattr(hashes, "has_v1", True)
+            if callable(has_v1):
+                has_v1 = has_v1()
+            if has_v1:
+                value = str(hashes.v1)
+                if value and value != ZERO_HASH:
+                    return value
+        except Exception:  # noqa: BLE001 - an older binding, or no metadata yet
+            pass
+
+    getter = getattr(source, "info_hash", None)
+    if getter is not None:
+        try:
+            value = str(getter() if callable(getter) else getter)
+            if value and value != ZERO_HASH:
+                return value
+        except Exception:  # noqa: BLE001 - as above
+            pass
+    return None
+
+
 def _identify(atp):
     """
     The v1 infohash of a torrent that has not been added yet.
@@ -99,22 +145,11 @@ def _identify(atp):
     """
     info = getattr(atp, "ti", None)
     if info is not None:
-        try:
-            value = str(info.info_hash())
-            if value and value != ZERO_HASH:
-                return value
-        except Exception:
-            pass
+        value = _v1_of(info)
+        if value:
+            return value
 
-    for attribute in ("info_hashes", "info_hash"):
-        try:
-            holder = getattr(atp, attribute)
-            value = str(getattr(holder, "v1", holder))
-            if value and value != ZERO_HASH:
-                return value
-        except Exception:
-            continue
-    return None
+    return _v1_of(atp)
 
 
 def _bucketise(values, buckets, reduce_fn):
@@ -306,7 +341,7 @@ class Sidecar:
                 target=self._deprioritise_when_ready, args=(handle,), daemon=True
             ).start()
 
-        info_hash = str(handle.info_hash())
+        info_hash = _v1_of(handle)
         with self._lock:
             self._handles[info_hash] = handle
         return {"infoHash": info_hash}
@@ -598,7 +633,7 @@ class Sidecar:
 
         return {
             "torrentFile": base64.b64encode(raw).decode(),
-            "infoHash": str(info.info_hash()),
+            "infoHash": _v1_of(info),
             "name": info.name(),
             "size": info.total_size(),
             "pieceLength": info.piece_length(),
@@ -697,7 +732,7 @@ class Sidecar:
         entry = info.files()
 
         return {
-            "infoHash": str(handle.info_hash()),
+            "infoHash": _v1_of(handle),
             "pieceLength": info.piece_length(),
             "numPieces": info.num_pieces(),
             "name": entry.file_name(index),
@@ -731,7 +766,7 @@ class Sidecar:
             self._session.wait_for_alert(500)
             for alert in self._session.pop_alerts():
                 if isinstance(alert, lt.save_resume_data_alert):
-                    self._write_resume(str(alert.handle.info_hash()), alert.params)
+                    self._write_resume(_v1_of(alert.handle), alert.params)
                     saved -= 1
                 elif isinstance(alert, lt.save_resume_data_failed_alert):
                     saved -= 1
@@ -752,7 +787,7 @@ class Sidecar:
             handle = self._handles.get(info_hash)
         if handle is None:
             for candidate in self._session.get_torrents():
-                if str(candidate.info_hash()) == info_hash:
+                if _v1_of(candidate) == info_hash:
                     return candidate
             raise KeyError(f"no such torrent: {info_hash}")
         return handle
@@ -788,7 +823,7 @@ class Sidecar:
             progress = (s.num_pieces / total_pieces) if total_pieces else 0.0
 
         return {
-            "infoHash": str(handle.info_hash()),
+            "infoHash": _v1_of(handle),
             "name": s.name,
             # total_wanted is zero in cache mode, so report the real size.
             "size": handle.torrent_file().total_size() if has_metadata else s.total_wanted,
