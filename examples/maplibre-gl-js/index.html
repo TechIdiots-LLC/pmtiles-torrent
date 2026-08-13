@@ -9,11 +9,13 @@
       html, body { margin: 0; height: 100%; font: 13px/1.5 system-ui, sans-serif; }
       #map { position: absolute; inset: 0; }
       #panel {
-        position: absolute; top: 10px; left: 10px; z-index: 1; width: 22rem;
+        position: absolute; top: 10px; left: 10px; z-index: 1; width: 23rem;
         background: rgba(255, 255, 255, 0.94); border-radius: 6px; padding: 0.7rem 0.9rem;
         box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
       }
-      #panel h1 { font-size: 14px; margin: 0 0 0.4rem; }
+      #panel h1 { font-size: 14px; margin: 0 0 0.2rem; }
+      #transport { margin: 0 0 0.5rem; color: #666; }
+      #transport a { color: #06c; }
       #panel dl { display: grid; grid-template-columns: auto 1fr; gap: 0.15rem 0.6rem; margin: 0; }
       #panel dt { color: #666; }
       #panel dd { margin: 0; font-variant-numeric: tabular-nums; }
@@ -25,12 +27,12 @@
     <div id="map"></div>
     <div id="panel">
       <h1>pmtiles-torrent — maplibre-gl-js</h1>
+      <p id="transport"></p>
       <dl>
         <dt>peers</dt><dd id="peers">—</dd>
         <dt>from swarm</dt><dd id="down">—</dd>
         <dt>seeded back</dt><dd id="up">—</dd>
         <dt>cache</dt><dd id="cache">—</dd>
-        <dt>tiles</dt><dd id="tiles">0</dd>
       </dl>
       <div id="log"></div>
     </div>
@@ -47,29 +49,38 @@
 
     <script type="module">
       import maplibregl from 'maplibre-gl';
-      import { PMTiles } from 'pmtiles';
+      import { PMTiles, Protocol } from 'pmtiles';
       import WebTorrent from 'webtorrent';
       // Built from this repository: `npm run build` first.
       import { TorrentSource } from '../../dist/esm/index.js';
       import { WebTorrentEngine } from '../../dist/esm/webtorrent.js';
 
       // ---------------------------------------------------------------------
-      // The only thing you should need to change.
+      // The only things you should need to change.
       //
-      // A magnet is enough on its own: `dn` names the file, `tr` finds peers,
-      // and `ws` gives an HTTP fallback for when there are none. Copy one from
-      // a pmtiles-swarm console, or from the `torrent` block of any TileJSON it
-      // serves.
+      // ARCHIVE_URL is where the .pmtiles file is served over HTTP. MAGNET is
+      // the same archive in the swarm — copy both from a pmtiles-swarm console,
+      // or from the `torrent` block of any TileJSON it serves.
       //
       // Note the wss:// tracker. A browser speaks WebRTC only — it cannot reach
       // TCP or uTP peers at all — so without a websocket tracker it will find
       // nobody, however healthy the swarm looks elsewhere.
       // ---------------------------------------------------------------------
+      const ARCHIVE_URL = 'https://swarm.example.org/files/example.pmtiles';
       const MAGNET =
         'magnet:?xt=urn:btih:0000000000000000000000000000000000000000' +
         '&dn=example.pmtiles' +
         '&tr=' + encodeURIComponent('wss://tracker.openwebtorrent.com') +
-        '&ws=' + encodeURIComponent('https://swarm.example.org/archives/0000/example.pmtiles');
+        '&ws=' + encodeURIComponent(ARCHIVE_URL);
+
+      // One string names the archive both ways: the HTTP URL, and the magnet in
+      // the fragment. A fragment is never sent in a request, so the URL stays a
+      // perfectly ordinary archive URL to anything that does not look at it.
+      const SOURCE_URL = `${ARCHIVE_URL}#${MAGNET}`;
+
+      // Add ?http to the page URL to skip the swarm entirely. Same style, same
+      // source URL, no code changes — which is the point of the section below.
+      const useTorrent = !new URLSearchParams(location.search).has('http');
 
       const log = (message) => {
         const line = document.createElement('div');
@@ -77,70 +88,60 @@
         document.getElementById('log').prepend(line);
       };
 
-      // One client for the page. Sharing it matters as soon as there is more
-      // than one archive: one peer pool, one set of connections.
-      const client = new WebTorrent();
-      client.on('error', (error) => log(`client: ${error.message}`));
+      // ---------------------------------------------------------------------
+      // The whole integration.
+      //
+      // TorrentSource implements the pmtiles Source interface, so it drops into
+      // the PMTiles library in place of the FetchSource it would otherwise
+      // build for itself. Nothing here is tile-aware: the archive is one file
+      // and PMTiles resolves a tile to a byte range, which the swarm serves as
+      // readily as a web server does.
+      //
+      // The registration is what makes it a drop-in rather than a replacement.
+      // Protocol.add() keys an instance by source.getKey(), and the protocol
+      // handler looks up whatever follows `pmtiles://` before constructing
+      // anything. Register under that exact string and the torrent source wins;
+      // do not register, and the same URL loads over HTTP with no other
+      // difference. That is why `key` is set to SOURCE_URL, fragment included —
+      // a key that does not match character-for-character does not error, it
+      // silently falls back to HTTP.
+      // ---------------------------------------------------------------------
+      const protocol = new Protocol({ metadata: true });
+      maplibregl.addProtocol('pmtiles', protocol.tile);
 
-      const engine = new WebTorrentEngine(MAGNET, {
-        client,
-        // Deliberately no `resumePath`. It is the only part of this engine that
-        // touches node:fs, and leaving it unset is what makes the package run
-        // unmodified in a browser.
-        maxWebConns: 8,
-      });
+      let client = null;
+      let source = null;
 
-      // TorrentSource implements the pmtiles Source interface — getBytes(),
-      // getKey() — so the pmtiles library reads through the swarm without
-      // knowing anything about BitTorrent. Nothing here is tile-aware: the
-      // archive is one file, and PMTiles resolves a tile to a byte range.
-      const source = new TorrentSource(engine, { cachePieces: 24 });
-      const archive = new PMTiles(source);
+      if (useTorrent) {
+        // One client for the page. Sharing it matters as soon as there is more
+        // than one archive: one peer pool, one set of connections.
+        client = new WebTorrent();
+        client.on('error', (error) => log(`client: ${error.message}`));
+
+        const engine = new WebTorrentEngine(MAGNET, {
+          client,
+          // Deliberately no `resumePath`. It is the only part of this engine
+          // that touches node:fs, and leaving it unset is what makes the
+          // package run unmodified in a browser.
+          maxWebConns: 8,
+        });
+
+        source = new TorrentSource(engine, { key: SOURCE_URL, cachePieces: 24 });
+        protocol.add(new PMTiles(source));
+        log('Reading through the swarm.');
+      } else {
+        log('Reading over HTTP — ?http is set.');
+      }
+
+      document.getElementById('transport').innerHTML = useTorrent
+        ? 'transport: <b>swarm</b> · <a href="?http">try HTTP instead</a>'
+        : 'transport: <b>HTTP</b> · <a href="?">try the swarm instead</a>';
 
       // ---------------------------------------------------------------------
-      // The protocol handler. addProtocol claims a URL scheme, which is what
-      // lets a perfectly ordinary style string route to us.
+      // An ordinary style. Nothing in it knows about BitTorrent: the source is
+      // a pmtiles:// URL of the sort maplibre-gl-js has understood since v5,
+      // and it renders on a page that never loaded this library at all.
       // ---------------------------------------------------------------------
-      let tilesServed = 0;
-
-      maplibregl.addProtocol('torrent', async (params, abortController) => {
-        const rest = params.url.replace(/^torrent:\/\//, '');
-
-        // `torrent://tiles.json` — derived rather than fetched. Everything a
-        // TileJSON carries is in the archive: the header has the zoom range,
-        // bounds and centre, and the metadata has the name and vector layers.
-        // So no server is involved in describing the map, only in hosting the
-        // bytes — and even that is optional once there are peers.
-        if (rest === 'tiles.json') {
-          const [header, metadata] = await Promise.all([
-            archive.getHeader(),
-            archive.getMetadata(),
-          ]);
-          const doc = {
-            tilejson: '3.0.0',
-            scheme: 'xyz',
-            tiles: ['torrent://{z}/{x}/{y}'],
-            minzoom: header.minZoom,
-            maxzoom: header.maxZoom,
-            bounds: [header.minLon, header.minLat, header.maxLon, header.maxLat],
-            center: [header.centerLon, header.centerLat, header.centerZoom],
-            ...(metadata?.name ? { name: metadata.name } : {}),
-            ...(metadata?.attribution ? { attribution: metadata.attribution } : {}),
-            ...(metadata?.vector_layers ? { vector_layers: metadata.vector_layers } : {}),
-          };
-          log(`TileJSON derived from the archive (z${doc.minzoom}–${doc.maxzoom})`);
-          return { data: doc };
-        }
-
-        const [z, x, y] = rest.split('/').map(Number);
-        const tile = await archive.getZxy(z, x, y, abortController.signal);
-        tilesServed += 1;
-        document.getElementById('tiles').textContent = String(tilesServed);
-        // A tile that is absent from the archive is not an error: 204-equivalent
-        // for vector, and MapLibre draws nothing rather than logging.
-        return { data: tile?.data ?? new Uint8Array() };
-      });
-
       const map = new maplibregl.Map({
         container: 'map',
         center: [0, 20],
@@ -148,9 +149,7 @@
         style: {
           version: 8,
           sources: {
-            // One ordinary source entry. The scheme is the only unusual part,
-            // and it is what the handler above claims.
-            archive: { type: 'vector', url: 'torrent://tiles.json' },
+            archive: { type: 'vector', url: `pmtiles://${SOURCE_URL}` },
           },
           layers: [
             { id: 'bg', type: 'background', paint: { 'background-color': '#dfe7ef' } },
@@ -187,6 +186,7 @@
       // every piece pulled is a piece served back, so a popular region gets
       // cheaper as more people look at it.
       setInterval(() => {
+        if (!useTorrent) return;
         const torrent = client.torrents[0];
         const stats = source.stats;
         document.getElementById('peers').textContent = torrent ? torrent.numPeers : '—';
