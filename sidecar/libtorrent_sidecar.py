@@ -54,6 +54,24 @@ STATE_MAP = {
 }
 
 
+# States in which libtorrent cannot answer a piece read, however valid the
+# index. A torrent passes through these on its way in — and again whenever its
+# files have been deleted underneath it, which is how a resync starts — so they
+# are a normal part of an archive's life rather than an error condition.
+#
+# Named through getattr because the set is not identical across binding
+# versions, and an AttributeError here would take down the whole sidecar at
+# import time over a state that only affects one wait loop.
+UNREADY_STATES = frozenset(
+    state
+    for state in (
+        getattr(lt.torrent_status, name, None)
+        for name in ("checking_files", "checking_resume_data", "downloading_metadata")
+    )
+    if state is not None
+)
+
+
 # Peer flags, looked up by name rather than assumed to exist.
 #
 # The bindings do not expose the same set across versions — `utp_socket` is in
@@ -704,15 +722,31 @@ class Sidecar:
         set_piece_deadline is the primitive that makes on-demand tile serving
         work: it promotes a piece to the front of the queue rather than waiting
         for the normal picker. qBittorrent's API has no equivalent.
+
+        The wait for the torrent to be *able* to answer is part of the read
+        rather than a precondition on it. A torrent that has just been added --
+        or re-added after its files were deleted -- spends its first seconds
+        without metadata and then checking, and libtorrent answers a piece read
+        in either state by rejecting the index outright. Asking for piece 0 of
+        an archive whose piece count is still zero therefore came back as
+        "invalid piece index in slot list", which reads as a corrupt torrent
+        and is in fact "ask again in a moment".
+
+        Waiting inside the caller's own timeout is the honest shape for that:
+        the budget is already there, the condition clears on its own, and a
+        caller who retries on a schedule of its own would otherwise pay a
+        backoff for a torrent that was seconds from being readable.
         """
         handle = self._handle(params["infoHash"])
         index = int(params["piece"])
         deadline = int(params.get("deadlineMs", 1000))
+        timeout = time.time() + float(params.get("timeoutMs", 60000)) / 1000
+
+        self._await_readable(handle, index, timeout)
 
         handle.piece_priority(index, 7)
         handle.set_piece_deadline(index, deadline, lt.deadline_flags_t.alert_when_available)
 
-        timeout = time.time() + float(params.get("timeoutMs", 60000)) / 1000
         while time.time() < timeout:
             alert = self._session.wait_for_alert(500)
             if alert is None:
@@ -720,9 +754,68 @@ class Sidecar:
             for item in self._session.pop_alerts():
                 if isinstance(item, lt.read_piece_alert) and item.piece == index:
                     if item.error.value() != 0:
-                        raise RuntimeError(f"piece {index}: {item.error.message()}")
+                        # Said with the torrent's state attached. libtorrent's
+                        # wording for these is terse and sometimes legacy, and
+                        # on its own gives a caller nothing to act on.
+                        raise RuntimeError(
+                            f"piece {index}: {item.error.message()}"
+                            f" ({self._describe(handle)})"
+                        )
                     return {"piece": index, "data": base64.b64encode(item.buffer).decode()}
-        raise TimeoutError(f"timed out waiting for piece {index}")
+        raise TimeoutError(
+            f"timed out waiting for piece {index} ({self._describe(handle)})"
+        )
+
+    def _await_readable(self, handle, index, deadline):
+        """
+        Block until this torrent can answer a piece read, or explain why not.
+
+        Two conditions, both temporary and both fatal to a read while they
+        last: metadata that has not arrived, and a torrent still checking what
+        is on disk. Neither means the archive is unreadable, only that it is
+        not readable yet.
+
+        The message on giving up matters as much as the waiting. "metadata has
+        not arrived yet" is what op_info already says for the same condition,
+        and consumers recognise it as a wait rather than a fault -- so the two
+        entry points now agree instead of one of them reporting a transient
+        state as a broken torrent.
+        """
+        while True:
+            status = handle.status()
+            if status.has_metadata and status.state not in UNREADY_STATES:
+                break
+
+            if time.time() >= deadline:
+                if not status.has_metadata:
+                    raise RuntimeError("metadata has not arrived yet")
+                raise RuntimeError(
+                    f"torrent is still {STATE_MAP.get(status.state, 'not ready')}"
+                    f" and cannot be read from yet"
+                )
+            time.sleep(0.25)
+
+        # Only meaningful once metadata is in hand, which is why it is checked
+        # here rather than on the way in: before that the piece count is zero
+        # and every index looks out of range, including the valid ones.
+        total = handle.torrent_file().num_pieces()
+        if not 0 <= index < total:
+            raise RuntimeError(
+                f"piece {index} is out of range; this torrent has {total} pieces"
+            )
+
+    def _describe(self, handle):
+        """A short account of a torrent's state, for attaching to an error."""
+        try:
+            status = handle.status()
+            held = status.num_pieces
+            total = handle.torrent_file().num_pieces() if status.has_metadata else 0
+            return (
+                f"{STATE_MAP.get(status.state, 'unknown')},"
+                f" {held}/{total} pieces, {status.num_peers} peers"
+            )
+        except Exception:  # noqa: BLE001 - a description must never be the failure
+            return "state unavailable"
 
     def op_set_priority(self, params):
         """

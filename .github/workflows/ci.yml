@@ -35,6 +35,10 @@ jobs:
       # it rather than leave the one non-JS component untested.
       - run: pip install libtorrent
       - run: python -m py_compile sidecar/libtorrent_sidecar.py
+      # The sidecar's own unit tests. They existed and nothing ran them, so a
+      # regression in the one component CI installs libtorrent for was the one
+      # regression CI could not catch.
+      - run: npm run test:sidecar
       - name: Smoke test the protocol
         run: |
           echo '{"id":1,"op":"version","params":{}}' | python sidecar/libtorrent_sidecar.py | tail -1 | tee /dev/stderr | grep -q '"ok": *true'

@@ -1,6 +1,6 @@
 {
   "name": "pmtiles-torrent",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Serve a PMTiles archive from a BitTorrent swarm — a torrent-backed Source for the pmtiles package",
   "type": "module",
   "main": "dist/cjs/index.cjs",
@@ -48,7 +48,7 @@
     "build": "tsup",
     "tsc": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "test:sidecar": "python test/test_sidecar_peers.py",
+    "test:sidecar": "python -m unittest discover -s test -p \"test_sidecar*.py\"",
     "prepublishOnly": "npm run tsc && npm test && npm run build"
   },
   "keywords": [

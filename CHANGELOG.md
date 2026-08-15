@@ -7,6 +7,30 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.4.5
+### 🐞 Bug fixes
+- **A torrent that was not ready yet reported a corrupt one.** Reading a piece from an archive whose
+  metadata had not arrived — or that was still checking what is on disk, which is how a resync
+  starts — was answered by libtorrent as `invalid piece index in slot list`. The piece count is zero
+  until metadata lands, so every index is out of range, including the valid ones. What is really
+  "ask again in a moment" therefore arrived under a name that reads as a damaged torrent, and a
+  caller retrying on a backoff paid minutes for a condition that clears in seconds.
+
+  `op_read_piece` now waits for the torrent to become readable inside the caller's existing timeout,
+  which is the honest shape for it: the budget is already there and the condition resolves on its
+  own. If the wait runs out it says `metadata has not arrived yet` — the same wording `op_info`
+  already uses for the same condition, so the two entry points finally agree — or names the state it
+  is stuck in. An index genuinely out of range now says so and says the piece count, and any error
+  libtorrent does raise carries the torrent's state, pieces held and peer count with it.
+
+  Worth knowing how much rests on this one read: the PMTiles v3 spec requires the root directory to
+  lie within the first 16,384 bytes, so a 16 KiB read at offset 0 fetches the header and the root
+  directory together — a single piece, after which the archive is servable. A node mirroring an
+  archive is unservable until exactly this read succeeds.
+- **The sidecar's own unit tests were never run.** `test:sidecar` named one file, and CI never
+  invoked it at all — so the one component CI installs libtorrent for was the one component it could
+  not catch a regression in. The script now discovers every `test_sidecar*.py`, and CI runs it.
+
 ## 0.4.4
 ### 🐞 Bug fixes
 - **The piece bars only told the truth at 0% and 100%.** A column covers many pieces — 178,000
