@@ -7,6 +7,35 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.4.6
+### ✨ Features and improvements
+- **The end of an archive is fetched before anything has read its header.** Everything the source
+  prioritises -- the root directory, the JSON metadata, the leaf directories -- is derived from the
+  header, which leaves a gap at the start: until a header can be read, nothing points anywhere but
+  at the header, so the structural sections are only ever asked for on a second pass. planetiler
+  uses the spec's permission to relocate sections and writes the JSON metadata and then the leaf
+  directories *after* all the tile data, so on those archives the tail is structure rather than
+  tiles -- and it is the half a partial mirror is least likely to hold, since tile data arrives in
+  whatever order the swarm offers while nothing at all asks for the end. One piece of it is now
+  hinted at normal priority as soon as the geometry is known, below the header everything is
+  blocked on and above the tile data nobody asked for. Deliberately a single piece: on a
+  canonically laid out archive, tippecanoe's among them, the tail is ordinary tile data and this
+  fetches a piece nobody wanted -- a fair price for removing a round trip from every planetiler
+  archive, and not one worth paying at a larger window.
+
+### 🐞 Bug fixes
+- **The sidecar was told why a read failed and threw it away.** The loop that waits for a piece
+  drains the session's alert queue and kept only the `read_piece_alert`, discarding everything else
+  -- including `torrent_error_alert` and `file_error_alert`, which are how libtorrent says a piece
+  could not be written or a file could not be opened. The session subscribes to
+  `error_notification` and `storage_notification` precisely so those arrive, and then the one loop
+  running while a read is outstanding binned them. A full disk, an unwritable save path and a
+  torrent that cannot verify its pieces were all reduced to the same silent timeout -- and because
+  draining removes them from the queue, nothing else could see them either. They are now
+  collected, appended to the error the caller gets, and said once on stderr, since a storage
+  failure outlives the request that noticed it and the next caller has no other way to learn it
+  happened.
+
 ## 0.4.5
 ### 🐞 Bug fixes
 - **A torrent that was not ready yet reported a corrupt one.** Reading a piece from an archive whose

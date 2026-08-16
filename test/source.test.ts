@@ -328,9 +328,11 @@ describe('directory prefetch', () => {
 
     await source.getBytes(0, 16384);
 
-    // Root and metadata are small and fetched eagerly; the leaf section is
-    // queued for idle hydration instead of competing with the read.
+    // The tail goes first, blind, before any header has been read. Root and
+    // metadata follow once it has, small and fetched eagerly; the leaf section
+    // is queued for idle hydration instead of competing with the read.
     assert.deepStrictEqual(engine.hints, [
+      { offset: 1488, length: 512, priority: 'normal' },
       { offset: 127, length: 200, priority: 'critical' },
       { offset: 327, length: 100, priority: 'high' },
     ]);
@@ -348,7 +350,7 @@ describe('directory prefetch', () => {
 
     assert.deepStrictEqual(
       engine.hints.map((h) => h.offset),
-      [127, 327],
+      [1488, 127, 327],
     );
   });
 
@@ -368,7 +370,9 @@ describe('directory prefetch', () => {
     const source = new TorrentSource(on);
     await source.getBytes(0, 200);
     await source.getBytes(0, 200);
-    assert.strictEqual(on.hints.length, 2);
+    // Tail, root, metadata -- and the header is only parsed once however many
+    // times it is read.
+    assert.strictEqual(on.hints.length, 3);
   });
 
   it('ignores archives that are not PMTiles v3', async () => {
@@ -376,6 +380,52 @@ describe('directory prefetch', () => {
     const source = new TorrentSource(engine);
 
     await source.getBytes(0, 200);
+
+    // The tail is hinted regardless -- it is a bet placed before anything is
+    // known about the archive -- but nothing is derived from a header that did
+    // not parse.
+    assert.deepStrictEqual(
+      engine.hints.map((h) => h.priority),
+      ['normal'],
+    );
+  });
+
+  it('bets on the tail before any header has been read', async () => {
+    // The gap this fills: everything else here is derived from the header, so
+    // until one can be read nothing points anywhere but at the header, and the
+    // structural sections are only ever asked for on a second pass. planetiler
+    // writes the metadata and the leaf directories after all the tile data, so
+    // on those archives the tail is exactly what the second pass would want.
+    const engine = new FakeEngine(ramp(2000), { pieceLength: 512 });
+    await new TorrentSource(engine).ready();
+
+    assert.deepStrictEqual(engine.hints, [
+      { offset: 1488, length: 512, priority: 'normal' },
+    ]);
+  });
+
+  it('does not bet more than one piece on it', async () => {
+    // It is a guess: on a canonically laid out archive, tippecanoe's among
+    // them, the tail is ordinary tile data and this fetches a piece nobody
+    // asked for. One piece is the price; a window would not be.
+    const engine = new FakeEngine(ramp(100000), { pieceLength: 4096 });
+    await new TorrentSource(engine).ready();
+
+    assert.strictEqual(engine.hints[0].length, 4096);
+  });
+
+  it('does not run off the front of an archive smaller than a piece', async () => {
+    const engine = new FakeEngine(ramp(300), { pieceLength: 4096 });
+    await new TorrentSource(engine).ready();
+
+    assert.deepStrictEqual(engine.hints, [
+      { offset: 0, length: 300, priority: 'normal' },
+    ]);
+  });
+
+  it('places no bet when prefetching is off', async () => {
+    const engine = new FakeEngine(ramp(2000), { pieceLength: 512 });
+    await new TorrentSource(engine, { prefetchDirectories: false }).ready();
 
     assert.strictEqual(engine.hints.length, 0);
   });
@@ -505,10 +555,11 @@ describe('idle hydration', () => {
 
     await source.getBytes(0, 200);
 
-    // Root and metadata only — the leaf section must not compete with reads.
+    // The tail bet, then root and metadata — the leaf section must not compete
+    // with reads.
     assert.deepStrictEqual(
       engine.hints.map((h) => h.offset),
-      [127, 177],
+      [1488, 127, 177],
     );
     assert.strictEqual(source.stats.hydrating, false);
     await source.destroy();
@@ -576,7 +627,7 @@ describe('idle hydration', () => {
 
     assert.deepStrictEqual(
       engine.hints.map((h) => h.offset),
-      [127, 177],
+      [1488, 127, 177],
     );
     await source.destroy();
   });

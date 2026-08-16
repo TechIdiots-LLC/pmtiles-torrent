@@ -153,3 +153,59 @@ class UnreadyStates(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Problems(unittest.TestCase):
+    """Reporting what libtorrent said, instead of discarding it.
+
+    The read loop drains the session's alert queue and used to keep only the
+    read_piece_alert.  Everything else went in the bin -- including the alerts
+    that say a piece could not be written or a file could not be opened, which
+    the session subscribes to precisely so they arrive.  A full disk, an
+    unwritable save path and a torrent that cannot verify its pieces all became
+    the same silent timeout.
+    """
+
+    def test_the_bindings_expose_the_alerts_worth_keeping(self):
+        names = [a.__name__ for a in sidecar._PROBLEM_ALERTS]
+        self.assertIn("torrent_error_alert", names)
+        self.assertIn("file_error_alert", names)
+
+    def test_anything_that_is_not_a_fault_is_not_reported(self):
+        self.assertIsNone(sidecar._problem(object()))
+        self.assertIsNone(sidecar._problem(None))
+
+    def test_nothing_is_appended_when_nothing_went_wrong(self):
+        self.assertEqual(sidecar._joined([]), "")
+
+    def test_faults_are_appended_to_the_message_that_carries_them(self):
+        joined = sidecar._joined(["file_error_alert: disk full", "x: y"])
+        self.assertIn("libtorrent also reported", joined)
+        self.assertIn("disk full", joined)
+        self.assertIn("x: y", joined)
+
+    def test_a_description_never_becomes_the_failure(self):
+        # Attached to an error path, so an alert whose message() raises must not
+        # replace the fault being reported with one about reporting it.
+        class Hostile:
+            def message(self):
+                raise RuntimeError("this alert cannot describe itself")
+
+        original = sidecar._PROBLEM_ALERTS
+        sidecar._PROBLEM_ALERTS = (Hostile,)
+        try:
+            self.assertEqual(sidecar._problem(Hostile()), "Hostile")
+        finally:
+            sidecar._PROBLEM_ALERTS = original
+
+    def test_a_recognised_alert_is_described_by_kind_and_message(self):
+        class Friendly:
+            def message(self):
+                return "disk full"
+
+        original = sidecar._PROBLEM_ALERTS
+        sidecar._PROBLEM_ALERTS = (Friendly,)
+        try:
+            self.assertEqual(sidecar._problem(Friendly()), "Friendly: disk full")
+        finally:
+            sidecar._PROBLEM_ALERTS = original

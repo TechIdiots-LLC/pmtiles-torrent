@@ -65,8 +65,10 @@ describe('end to end against a real PMTiles archive', () => {
 
     await archive.getHeader();
 
-    // The fixture has no leaf directories, so only root and metadata are hinted.
+    // The tail is bet on blind before the header is read; the fixture has no
+    // leaf directories, so root and metadata are all that follow from it.
     assert.deepStrictEqual(engine.hints, [
+      { offset: 404, length: 64, priority: 'normal' },
       { offset: 127, length: 25, priority: 'critical' },
       { offset: 152, length: 247, priority: 'high' },
     ]);

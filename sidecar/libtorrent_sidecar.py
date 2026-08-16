@@ -54,6 +54,52 @@ STATE_MAP = {
 }
 
 
+# Alerts that explain why a read failed rather than merely reporting progress.
+#
+# Named through getattr because the set differs across binding versions, and a
+# missing one must cost only that alert rather than the import.
+_PROBLEM_ALERTS = tuple(
+    alert
+    for alert in (
+        getattr(lt, name, None)
+        for name in (
+            "torrent_error_alert",
+            "file_error_alert",
+            "storage_moved_failed_alert",
+            "fastresume_rejected_alert",
+            "hash_failed_alert",
+        )
+    )
+    if alert is not None
+)
+
+
+def _problem(alert):
+    """
+    One line describing an alert that explains a failure, or None.
+
+    @param alert: Anything popped from the session.
+    @return: A short description, or None if the alert is not a fault.
+    """
+    if not isinstance(alert, _PROBLEM_ALERTS):
+        return None
+    kind = type(alert).__name__
+    try:
+        return f"{kind}: {alert.message()}"
+    except Exception:  # noqa: BLE001 - a description must never be the failure
+        return kind
+
+
+def _joined(problems):
+    """
+    Appends collected problems to an error message, or nothing.
+
+    @param problems: Descriptions gathered while waiting.
+    @return: A string to append.
+    """
+    return f"; libtorrent also reported: {'; '.join(problems)}" if problems else ""
+
+
 # States in which libtorrent cannot answer a piece read, however valid the
 # index. A torrent passes through these on its way in — and again whenever its
 # files have been deleted underneath it, which is how a resync starts — so they
@@ -747,6 +793,19 @@ class Sidecar:
         handle.piece_priority(index, 7)
         handle.set_piece_deadline(index, deadline, lt.deadline_flags_t.alert_when_available)
 
+        # Whatever libtorrent said went wrong while we waited.
+        #
+        # This loop drains the session's alert queue, and used to keep only the
+        # read_piece_alert and drop the rest on the floor -- including
+        # torrent_error_alert and file_error_alert, which are the alerts that
+        # say a piece could not be written or a file could not be opened. The
+        # session subscribes to error_notification and storage_notification
+        # precisely so those arrive, and then the one loop that runs while a
+        # read is outstanding threw them away. A disk that is full, a save path
+        # that is not writable and a torrent that cannot verify its pieces all
+        # became the same silent timeout.
+        problems = []
+
         while time.time() < timeout:
             alert = self._session.wait_for_alert(500)
             if alert is None:
@@ -759,11 +818,24 @@ class Sidecar:
                         # on its own gives a caller nothing to act on.
                         raise RuntimeError(
                             f"piece {index}: {item.error.message()}"
-                            f" ({self._describe(handle)})"
+                            f" ({self._describe(handle)}){_joined(problems)}"
                         )
                     return {"piece": index, "data": base64.b64encode(item.buffer).decode()}
+
+                note = _problem(item)
+                if note is None:
+                    continue
+                # Kept for this read's own report, and said once out loud, since
+                # a storage failure outlives the request that noticed it and the
+                # next caller has no way to learn it happened.
+                if note not in problems:
+                    problems.append(note)
+                    sys.stderr.write(f"[sidecar] {note}\n")
+                    sys.stderr.flush()
+
         raise TimeoutError(
-            f"timed out waiting for piece {index} ({self._describe(handle)})"
+            f"timed out waiting for piece {index}"
+            f" ({self._describe(handle)}){_joined(problems)}"
         )
 
     def _await_readable(self, handle, index, deadline):
