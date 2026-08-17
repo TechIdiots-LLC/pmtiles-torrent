@@ -20,13 +20,29 @@
   2.0.13 against 400 MiB: one tick of a 5ms ticker with no callback against thirty-two with one,
   and a longest stall of 580ms against 64ms.
 
-  Only `create` is threaded. It is a pure function of its parameters — it builds its own
-  `file_storage`, reads a file and returns bytes, touching no session, handle or shared state — so
-  it cannot race anything. `read_piece` blocks the loop the same way and does **not** have that
-  property, since it consumes session alerts and two running at once would steal each other's; it
-  is left alone until alert delivery is reworked to suit. Replies are matched by id, so answering
-  out of order is what the protocol already expects; a write lock keeps two threads from splicing
-  one line-delimited reply into another.
+  Replies are matched by id, so answering out of order is what the protocol already expects; a
+  write lock keeps two threads from splicing one line-delimited reply into another.
+
+- **`read_piece` no longer blocks everything else either, and alert delivery was reworked so it
+  safely can.** This is the one that mattered in normal running: every tile served from a
+  cache-mode archive goes through `read_piece`, which waits up to 60s for a piece to arrive from
+  the swarm, so a serving node's loop spent most of its life inside one and answered nothing
+  meanwhile.
+
+  It could not simply be threaded. Every consumer drained the session's single alert queue and
+  dropped what it did not want, so two concurrent reads would each have swallowed the other's
+  `read_piece_alert` and both would have timed out — the serial loop that made the sidecar
+  unresponsive was also the only thing keeping that correct. One pump thread now pops alerts and
+  offers each to whoever subscribed for it, which makes concurrent waiting safe and fixes two
+  things on its way past:
+
+  - a read now matches its alert on the **torrent** as well as the piece number. Piece 0 of one
+    archive and piece 0 of another are the same index, and draining the queue could not tell them
+    apart.
+  - a fault is reported **once, by the pump**, rather than only when a read happened to be
+    outstanding to notice it. A full disk outlives the request that saw it.
+
+  `reachability` is threaded too, for the same reason: it waits on a `session_stats_alert`.
 
 ## 0.6.1
 

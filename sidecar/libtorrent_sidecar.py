@@ -27,8 +27,10 @@ macOS: brew install libtorrent-rasterbar; or pip install libtorrent).
 """
 
 import base64
+import contextlib
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -322,6 +324,28 @@ def _peer_flags(peer):
     return [name for name in PEER_FLAGS if _has_flag(peer, name)]
 
 
+class _Subscription:
+    """
+    One caller's interest in some alerts, fed by the pump.
+
+    Holds a queue rather than a single slot because a read can care about more
+    than one alert: the piece it is waiting for, and anything that explains why
+    it is not coming.
+    """
+
+    def __init__(self, wanted):
+        self.wanted = wanted
+        self.queue = queue.Queue()
+
+    def offer(self, alert):
+        """Takes a copy of the alert if it is one this caller asked for."""
+        try:
+            if self.wanted(alert):
+                self.queue.put(alert)
+        except Exception:  # noqa: BLE001 - a bad predicate must not stop the pump
+            pass
+
+
 class Sidecar:
     """Owns the libtorrent session and answers requests from the parent."""
 
@@ -353,6 +377,69 @@ class Sidecar:
         self._session = lt.session(pack)
         if self._resume_dir:
             os.makedirs(self._resume_dir, exist_ok=True)
+
+        # One thread pops alerts; everything else subscribes.
+        #
+        # The session has a single alert queue and popping it is destructive,
+        # so every consumer that drained it took everybody else's alerts with
+        # it. That was survivable only while exactly one consumer could run at
+        # a time, which is to say only while the request loop was serial —
+        # meaning the thing that made the sidecar unresponsive was also the
+        # thing keeping this correct. Two concurrent piece reads would each
+        # have swallowed the other's read_piece_alert and both timed out.
+        self._subscribers = []
+        self._subscriber_lock = threading.Lock()
+        self._stop = threading.Event()
+        # Said once per distinct fault, here rather than in whoever happened to
+        # be waiting. A full disk outlives the read that noticed it, and used
+        # to be reported only if a read was outstanding at the time.
+        self._reported = set()
+        self._pump = threading.Thread(target=self._pump_alerts, daemon=True)
+        self._pump.start()
+
+    # ---- alert delivery -------------------------------------------------
+
+    def _pump_alerts(self):
+        """Pops the session's alerts and hands each to whoever wants it."""
+        while not self._stop.is_set():
+            try:
+                self._session.wait_for_alert(500)
+                alerts = self._session.pop_alerts()
+            except Exception:  # noqa: BLE001 - a dying session must not spin
+                return
+            for alert in alerts:
+                note = _problem(alert)
+                if note is not None:
+                    with self._subscriber_lock:
+                        fresh = note not in self._reported
+                        if fresh:
+                            self._reported.add(note)
+                    if fresh:
+                        sys.stderr.write(f"[sidecar] {note}\n")
+                        sys.stderr.flush()
+                with self._subscriber_lock:
+                    subscribers = list(self._subscribers)
+                for subscriber in subscribers:
+                    subscriber.offer(alert)
+
+    @contextlib.contextmanager
+    def _subscribe(self, wanted):
+        """
+        Receives alerts matching `wanted` for the length of the block.
+
+        Registered before the thing that provokes the alert is asked for, never
+        after: the pump runs continuously, so an alert answered quickly can
+        arrive before a subscription made afterwards would have existed to
+        catch it.
+        """
+        subscription = _Subscription(wanted)
+        with self._subscriber_lock:
+            self._subscribers.append(subscription)
+        try:
+            yield subscription
+        finally:
+            with self._subscriber_lock:
+                self._subscribers.remove(subscription)
 
     # ---- operations -----------------------------------------------------
 
@@ -411,25 +498,25 @@ class Sidecar:
         One round of session counters, by name.
 
         post_session_stats answers through the alert queue, so this waits for
-        its own alert and returns the rest to nobody -- the same drain every
-        other alert consumer here performs. Bounded, because a session that
-        never answers must not hold a request open.
+        its own alert. Bounded, because a session that never answers must not
+        hold a request open.
+
+        Subscribed before posting, not after: the pump is already running, and
+        a session that answers immediately would otherwise have delivered the
+        alert to nobody.
 
         @return: The counters, or an empty mapping.
         """
-        self._session.post_session_stats()
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            self._session.wait_for_alert(200)
-            for alert in self._session.pop_alerts():
-                if isinstance(alert, lt.session_stats_alert):
-                    # A dict keyed by metric name in these bindings, despite
-                    # find_metric_idx existing beside it and suggesting indices.
-                    return dict(alert.values)
-                note = _problem(alert)
-                if note:
-                    sys.stderr.write(f"[sidecar] {note}\n")
-        return {}
+        wanted = lambda alert: isinstance(alert, lt.session_stats_alert)  # noqa: E731
+        with self._subscribe(wanted) as subscription:
+            self._session.post_session_stats()
+            try:
+                alert = subscription.queue.get(timeout=5)
+            except queue.Empty:
+                return {}
+        # A dict keyed by metric name in these bindings, despite find_metric_idx
+        # existing beside it and suggesting indices.
+        return dict(alert.values)
 
     def op_add(self, params):
         """Add a torrent from raw .torrent bytes or a magnet URI."""
@@ -1033,71 +1120,80 @@ class Sidecar:
 
         self._await_readable(handle, index, timeout)
 
-        handle.piece_priority(index, 7)
-        handle.set_piece_deadline(index, deadline, lt.deadline_flags_t.alert_when_available)
-
-        # Whatever libtorrent said went wrong while we waited.
+        # This read's own alerts, and only this read's.
         #
-        # This loop drains the session's alert queue, and used to keep only the
-        # read_piece_alert and drop the rest on the floor -- including
-        # torrent_error_alert and file_error_alert, which are the alerts that
-        # say a piece could not be written or a file could not be opened. The
-        # session subscribes to error_notification and storage_notification
-        # precisely so those arrive, and then the one loop that runs while a
-        # read is outstanding threw them away. A disk that is full, a save path
-        # that is not writable and a torrent that cannot verify its pieces all
-        # became the same silent timeout.
-        problems = []
-        # The last thing libtorrent said about this piece, kept for the timeout
-        # message rather than raised the moment it arrives. See below.
-        refused = None
-        armed = time.time()
+        # Matched on the torrent as well as the piece number, which draining the
+        # session queue could not do: piece 0 of one archive and piece 0 of
+        # another are the same index, so whichever read popped first took both.
+        # Problem alerts are taken by every reader at once, since a disk that is
+        # full is every outstanding read's explanation and not just the first
+        # one's to notice.
+        def wanted(alert):
+            if isinstance(alert, lt.read_piece_alert):
+                return alert.piece == index and alert.handle == handle
+            return _problem(alert) is not None
 
-        while time.time() < timeout:
-            alert = self._session.wait_for_alert(500)
-            if alert is None:
-                continue
-            for item in self._session.pop_alerts():
-                if isinstance(item, lt.read_piece_alert) and item.piece == index:
-                    if item.error.value() != 0:
-                        # Not a failure. "I do not have that piece yet."
-                        #
-                        # alert_when_available asks libtorrent to read the piece
-                        # when it lands; a piece that is not here yet is read
-                        # immediately anyway and errors, typically "invalid
-                        # piece index in slot list". Raising on that abandoned
-                        # the deadline that had just been set -- so the read
-                        # both refused to wait and cancelled the fetch that
-                        # would have satisfied it. On a 698 GiB archive the head
-                        # was asked for every ten minutes and given up on within
-                        # milliseconds each time, for 200 GiB.
-                        #
-                        # The caller's timeout is the budget for waiting, and it
-                        # is already running. Keep it.
-                        refused = item.error.message()
-                        continue
-                    return {"piece": index, "data": base64.b64encode(item.buffer).decode()}
+        with self._subscribe(wanted) as subscription:
+            handle.piece_priority(index, 7)
+            handle.set_piece_deadline(
+                index, deadline, lt.deadline_flags_t.alert_when_available
+            )
 
-                note = _problem(item)
-                if note is None:
-                    continue
-                # Kept for this read's own report, and said once out loud, since
-                # a storage failure outlives the request that noticed it and the
-                # next caller has no way to learn it happened.
-                if note not in problems:
-                    problems.append(note)
-                    sys.stderr.write(f"[sidecar] {note}\n")
-                    sys.stderr.flush()
+            # Whatever libtorrent said went wrong while we waited. The session
+            # subscribes to error_notification and storage_notification
+            # precisely so a disk that is full, a save path that is not
+            # writable and a torrent that cannot verify its pieces are three
+            # different answers rather than one silent timeout.
+            problems = []
+            # The last thing libtorrent said about this piece, kept for the
+            # timeout message rather than raised the moment it arrives.
+            refused = None
+            armed = time.time()
 
-            # A refused read consumes the deadline's alert, so re-arm it or the
-            # piece lands and nothing says so. Paced: a piece that is not here
-            # yet refuses instantly, and re-arming on every refusal is a spin.
-            if refused is not None and time.time() - armed >= 1:
-                handle.piece_priority(index, 7)
-                handle.set_piece_deadline(
-                    index, deadline, lt.deadline_flags_t.alert_when_available
-                )
-                armed = time.time()
+            while time.time() < timeout:
+                try:
+                    item = subscription.queue.get(timeout=0.5)
+                except queue.Empty:
+                    item = None
+
+                if isinstance(item, lt.read_piece_alert):
+                    if item.error.value() == 0:
+                        return {
+                            "piece": index,
+                            "data": base64.b64encode(item.buffer).decode(),
+                        }
+                    # Not a failure. "I do not have that piece yet."
+                    #
+                    # alert_when_available asks libtorrent to read the piece
+                    # when it lands; a piece that is not here yet is read
+                    # immediately anyway and errors, typically "invalid piece
+                    # index in slot list". Raising on that abandoned the
+                    # deadline that had just been set -- so the read both
+                    # refused to wait and cancelled the fetch that would have
+                    # satisfied it. On a 698 GiB archive the head was asked for
+                    # every ten minutes and given up on within milliseconds each
+                    # time, for 200 GiB.
+                    #
+                    # The caller's timeout is the budget for waiting, and it is
+                    # already running. Keep it.
+                    refused = item.error.message()
+                elif item is not None:
+                    # Kept for this read's own report. The pump has already said
+                    # it out loud, once, on behalf of everybody.
+                    note = _problem(item)
+                    if note is not None and note not in problems:
+                        problems.append(note)
+
+                # A refused read consumes the deadline's alert, so re-arm it or
+                # the piece lands and nothing says so. Paced: a piece that is
+                # not here yet refuses instantly, and re-arming on every refusal
+                # is a spin.
+                if refused is not None and time.time() - armed >= 1:
+                    handle.piece_priority(index, 7)
+                    handle.set_piece_deadline(
+                        index, deadline, lt.deadline_flags_t.alert_when_available
+                    )
+                    armed = time.time()
 
         if refused is not None:
             problems.append(f"last refusal: {refused}")
@@ -1237,6 +1333,12 @@ class Sidecar:
         try:
             self.op_save_resume({})
         finally:
+            # Stopped before the session goes, so the pump is not left calling
+            # wait_for_alert on something that has been deleted out from under
+            # it. It is a daemon thread and would die with the process anyway;
+            # this is about not printing a traceback on the way out.
+            self._stop.set()
+            self._pump.join(timeout=2)
             del self._session
         return {"stopped": True}
 
@@ -1338,14 +1440,15 @@ class Sidecar:
 # 60s, and archive details never loading -- all of them ordinary calls queued
 # behind one hash.
 #
-# Only `create`, deliberately. It is a pure function of its parameters: it
-# builds a file_storage and a create_torrent of its own, reads a file, and
-# returns bytes. It touches no session, no torrent handle and no shared state,
-# so running it on a thread cannot race anything. `read_piece` blocks the loop
-# the same way and does not have that property -- it consumes session alerts,
-# and two of those running at once would steal each other's -- so it stays here
-# until alert delivery is reworked to suit.
-THREADED_OPS = frozenset({"create"})
+# `read_piece` is the one that matters most in normal running. It waits up to
+# 60s for a piece to arrive from the swarm, and every tile served from a
+# cache-mode archive goes through it — so on a serving node the loop spent most
+# of its life inside one, and nothing else could be answered meanwhile. It is
+# here rather than alongside `create` from the start because it consumes session
+# alerts, and two concurrent reads draining one queue would have swallowed each
+# other's; alert delivery is a pump with subscribers now, which is what makes it
+# safe. `reachability` is here for the same reason: it waits on an alert too.
+THREADED_OPS = frozenset({"create", "read_piece", "reachability"})
 
 
 def main():

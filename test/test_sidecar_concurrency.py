@@ -11,6 +11,7 @@ Driven over the real stdin/stdout protocol rather than by calling the handlers,
 because the loop is the thing under test.
 """
 
+import base64
 import json
 import os
 import subprocess
@@ -161,6 +162,114 @@ class HashingDoesNotStarveTheLoop(unittest.TestCase):
         result = self.sidecar.wait(hashing, timeout=180)
         self.assertIsNotNone(result)
         self.assertTrue(result["ok"], result.get("error"))
+
+
+
+class ReadsDoNotStarveOrStealFromEachOther(unittest.TestCase):
+    """
+    The second instance of the same fault, and the one that mattered in normal
+    running: every tile served from a cache-mode archive goes through
+    `read_piece`, which waits up to 60s for a piece to arrive from the swarm. A
+    serial loop spent most of its life inside one.
+
+    It could not simply be threaded like `create`. Both reads drained the
+    session's single alert queue, so two at once would each have swallowed the
+    other's `read_piece_alert` and both would have timed out. Alert delivery is
+    a pump with subscribers now, which is what makes the threading safe -- so
+    both halves are worth holding to.
+    """
+
+    def setUp(self):
+        self.sidecar = SidecarProcess()
+        self.assertTrue(self.sidecar.ready.wait(60), "the sidecar never announced itself")
+        self.workspace = tempfile.mkdtemp(prefix="sidecar-reads-")
+
+    def tearDown(self):
+        self.sidecar.close()
+
+    def _seeded_archive(self, size=8 * 1024 * 1024, piece_length=1 << 20):
+        """A real torrent of real bytes, added complete so reads can answer."""
+        path = os.path.join(self.workspace, "planet.pmtiles")
+        payload = os.urandom(size)
+        with open(path, "wb") as handle:
+            handle.write(payload)
+
+        created = self.sidecar.call(
+            "create", {"path": path, "pieceLength": piece_length}, timeout=120
+        )
+        self.assertIsNotNone(created)
+        self.assertTrue(created["ok"], created.get("error"))
+
+        added = self.sidecar.call(
+            "add",
+            {
+                "torrentFile": created["result"]["torrentFile"],
+                "savePath": self.workspace,
+                "seedOnly": True,
+            },
+            timeout=60,
+        )
+        self.assertIsNotNone(added)
+        self.assertTrue(added["ok"], added.get("error"))
+        return added["result"]["infoHash"], payload, piece_length
+
+    def test_two_reads_at_once_each_get_their_own_piece(self):
+        # Draining a shared queue, whichever read popped first took both
+        # alerts: one returned somebody else's piece or the wrong one, and the
+        # other waited out its full timeout for an alert already consumed.
+        info_hash, payload, piece_length = self._seeded_archive()
+
+        wanted = [0, 1, 2, 3]
+        sent = {
+            piece: self.sidecar.send(
+                "read_piece",
+                {"infoHash": info_hash, "piece": piece, "timeoutMs": 30000},
+            )
+            for piece in wanted
+        }
+
+        for piece, request_id in sent.items():
+            reply = self.sidecar.wait(request_id, timeout=60)
+            self.assertIsNotNone(reply, f"piece {piece} was never answered")
+            self.assertTrue(reply["ok"], reply.get("error"))
+            self.assertEqual(reply["result"]["piece"], piece, "answered with another piece")
+
+            expected = payload[piece * piece_length : (piece + 1) * piece_length]
+            self.assertEqual(
+                base64.b64decode(reply["result"]["data"]),
+                expected,
+                f"piece {piece} came back with the wrong bytes",
+            )
+
+    def test_list_answers_while_a_read_is_waiting(self):
+        # A magnet has no metadata, so the read waits out its whole timeout
+        # without ever being able to answer — which is exactly the shape of a
+        # piece that has not arrived from the swarm yet, and what a serving node
+        # spends its time doing.
+        magnet = f"magnet:?xt=urn:btih:{'a' * 40}&dn=planet.pmtiles"
+        added = self.sidecar.call(
+            "add", {"magnet": magnet, "savePath": self.workspace}, timeout=60
+        )
+        self.assertIsNotNone(added)
+        self.assertTrue(added["ok"], added.get("error"))
+
+        reading = self.sidecar.send(
+            "read_piece",
+            {"infoHash": added["result"]["infoHash"], "piece": 0, "timeoutMs": 15000},
+        )
+        listing = self.sidecar.send("list")
+
+        reply = self.sidecar.wait(listing, timeout=10)
+        self.assertIsNotNone(reply, "list went unanswered while a read was waiting")
+        self.assertTrue(reply["ok"], reply.get("error"))
+
+        with self.sidecar.lock:
+            arrivals = list(self.sidecar.arrivals)
+        self.assertNotIn(
+            reading,
+            arrivals[: arrivals.index(listing)],
+            "the read answered first, so the loop is still serial",
+        )
 
 
 if __name__ == "__main__":
