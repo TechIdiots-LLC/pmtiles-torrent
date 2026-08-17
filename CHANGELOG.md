@@ -8,7 +8,25 @@
 
 ### 🐞 Bug fixes
 
-- _...Add new stuff here..._
+- **The sidecar answers while it is hashing an archive.** Adding a large local archive made
+  everything else unreachable for as long as the hash ran: `list` timed out after 60s, the console
+  header sat at "connecting…", and clicking an archive never loaded its details. Nothing was wrong
+  with any of those calls — the reader loop ran each request to completion before reading the next,
+  so they were queued behind one `create`, which for a 698 GiB archive is hours.
+
+  Two things were needed and neither works without the other. `create` now runs on a worker thread,
+  and `set_piece_hashes` is passed a progress callback — without one libtorrent holds the GIL for
+  the entire hash, so a worker thread would have starved the loop just the same. Measured on
+  2.0.13 against 400 MiB: one tick of a 5ms ticker with no callback against thirty-two with one,
+  and a longest stall of 580ms against 64ms.
+
+  Only `create` is threaded. It is a pure function of its parameters — it builds its own
+  `file_storage`, reads a file and returns bytes, touching no session, handle or shared state — so
+  it cannot race anything. `read_piece` blocks the loop the same way and does **not** have that
+  property, since it consumes session alerts and two running at once would steal each other's; it
+  is left alone until alert delivery is reworked to suit. Replies are matched by id, so answering
+  out of order is what the protocol already expects; a write lock keeps two threads from splicing
+  one line-delimited reply into another.
 
 ## 0.6.1
 

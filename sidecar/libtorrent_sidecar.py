@@ -948,7 +948,18 @@ class Sidecar:
             creator.set_priv(True)
         creator.set_creator(params.get("createdBy") or "pmtiles-swarm")
 
-        lt.set_piece_hashes(creator, os.path.dirname(path) or ".")
+        # The callback is not for progress -- it is what makes this yield.
+        #
+        # Without one, libtorrent's binding holds the GIL for the whole of
+        # set_piece_hashes, so no other Python thread runs until the last piece
+        # is done. Measured on 2.0.13 against a 400 MiB file: one tick of a
+        # 5ms ticker thread with no callback, thirty-two with one, and a
+        # longest stall of 580ms against 64ms. Passing a callback makes the
+        # binding release and reacquire the GIL per piece, which is what lets
+        # the reader loop keep answering `list` and `get` while an archive
+        # hashes. For a 698 GiB archive that is the difference between a
+        # console that works and one that times out for hours.
+        lt.set_piece_hashes(creator, os.path.dirname(path) or ".", lambda _index: None)
         entry = creator.generate()
         raw = lt.bencode(entry)
         info = lt.torrent_info(entry)
@@ -1318,13 +1329,47 @@ class Sidecar:
             handle.write(lt.write_resume_data_buf(params))
 
 
+# Operations run off the reader loop, because they take long enough to starve
+# everything else if they do not.
+#
+# `create` hashes an entire archive: minutes for a small one and hours for a
+# planet build, during which a strictly serial loop answers nothing. Reported
+# from the field as the console going to "connecting…", `list` timing out after
+# 60s, and archive details never loading -- all of them ordinary calls queued
+# behind one hash.
+#
+# Only `create`, deliberately. It is a pure function of its parameters: it
+# builds a file_storage and a create_torrent of its own, reads a file, and
+# returns bytes. It touches no session, no torrent handle and no shared state,
+# so running it on a thread cannot race anything. `read_piece` blocks the loop
+# the same way and does not have that property -- it consumes session alerts,
+# and two of those running at once would steal each other's -- so it stays here
+# until alert delivery is reworked to suit.
+THREADED_OPS = frozenset({"create"})
+
+
 def main():
     """Read requests from stdin, write responses to stdout, one JSON per line."""
     settings = json.loads(os.environ.get("SIDECAR_SETTINGS", "{}"))
     sidecar = Sidecar(settings)
 
+    # One writer at a time. Replies may now be produced by a worker thread while
+    # the reader loop is producing others, and two interleaved prints would
+    # corrupt both lines of a protocol that is one JSON object per line.
+    write_lock = threading.Lock()
+
+    def respond(message):
+        with write_lock:
+            print(json.dumps(message), flush=True)
+
     # Announce readiness so the parent does not have to guess.
-    print(json.dumps({"event": "ready", "libtorrent": lt.__version__}), flush=True)
+    respond({"event": "ready", "libtorrent": lt.__version__})
+
+    def run(handler, request_id, params):
+        try:
+            respond({"id": request_id, "ok": True, "result": handler(params)})
+        except Exception as error:  # noqa: BLE001 - report everything to the parent
+            respond({"id": request_id, "ok": False, "error": str(error)})
 
     for line in sys.stdin:
         line = line.strip()
@@ -1333,21 +1378,29 @@ def main():
         try:
             request = json.loads(line)
         except json.JSONDecodeError as error:
-            print(json.dumps({"id": None, "ok": False, "error": f"bad request: {error}"}), flush=True)
+            respond({"id": None, "ok": False, "error": f"bad request: {error}"})
             continue
 
         request_id = request.get("id")
         op = request.get("op", "")
         handler = getattr(sidecar, f"op_{op}", None)
         if handler is None:
-            print(json.dumps({"id": request_id, "ok": False, "error": f"unknown op: {op}"}), flush=True)
+            respond({"id": request_id, "ok": False, "error": f"unknown op: {op}"})
             continue
 
-        try:
-            result = handler(request.get("params") or {})
-            print(json.dumps({"id": request_id, "ok": True, "result": result}), flush=True)
-        except Exception as error:  # noqa: BLE001 - report everything to the parent
-            print(json.dumps({"id": request_id, "ok": False, "error": str(error)}), flush=True)
+        params = request.get("params") or {}
+        if op in THREADED_OPS:
+            # Replies are matched by id, not by arrival order, so answering out
+            # of order is already what the protocol expects. Daemon, because a
+            # hash in progress must not keep the process alive after a stop --
+            # the parent kills us either way, and libtorrent's hashing cannot be
+            # interrupted from here.
+            threading.Thread(
+                target=run, args=(handler, request_id, params), daemon=True
+            ).start()
+            continue
+
+        run(handler, request_id, params)
 
         if op == "shutdown":
             break
