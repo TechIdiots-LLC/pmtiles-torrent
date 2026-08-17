@@ -350,6 +350,77 @@ class Sidecar:
         """Report versions, so the parent can check compatibility."""
         return {"libtorrent": lt.__version__, "python": sys.version.split()[0]}
 
+    def op_reachability(self, _params):
+        """
+        Whether peers can open a connection to this node, or only the reverse.
+
+        Three states, and the middle one is the reason this exists. A node that
+        cannot be reached still downloads and still uploads -- it dials out and
+        works fine -- so nothing about its own traffic reveals that half the
+        swarm can never start a conversation with it. The cost is invisible and
+        permanent: fewer peers, slower starts, and a seed nobody can fetch from
+        unless they were introduced first.
+
+        `net.has_incoming_connections` is libtorrent's own answer and is the
+        honest one. It latches for the life of the session -- "has anything ever
+        connected inward" rather than "is one open now" -- so a node that was
+        reachable an hour ago and is merely quiet now stays green instead of
+        flickering to amber every time the last peer leaves.
+
+        The gauge cannot distinguish "firewalled" from "nobody has tried yet",
+        and neither can anything else: on a node with no peers the two are the
+        same observation. That is why the middle state is reported as unproven
+        rather than as blocked, and why the peer counts come with it.
+        """
+        handle = self._session
+        listening = bool(handle.is_listening())
+        port = handle.listen_port() if listening else None
+
+        stats = self._session_stats()
+        incoming = int(stats.get("peer.incoming_connections", 0))
+        ever = int(stats.get("net.has_incoming_connections", 0))
+        connected = int(stats.get("peer.num_peers_connected", 0))
+
+        if not listening:
+            state = "offline"
+        elif ever:
+            state = "open"
+        else:
+            state = "unproven"
+
+        return {
+            "state": state,
+            "listening": listening,
+            "port": port,
+            "incomingConnections": incoming,
+            "peersConnected": connected,
+        }
+
+    def _session_stats(self):
+        """
+        One round of session counters, by name.
+
+        post_session_stats answers through the alert queue, so this waits for
+        its own alert and returns the rest to nobody -- the same drain every
+        other alert consumer here performs. Bounded, because a session that
+        never answers must not hold a request open.
+
+        @return: The counters, or an empty mapping.
+        """
+        self._session.post_session_stats()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            self._session.wait_for_alert(200)
+            for alert in self._session.pop_alerts():
+                if isinstance(alert, lt.session_stats_alert):
+                    # A dict keyed by metric name in these bindings, despite
+                    # find_metric_idx existing beside it and suggesting indices.
+                    return dict(alert.values)
+                note = _problem(alert)
+                if note:
+                    sys.stderr.write(f"[sidecar] {note}\n")
+        return {}
+
     def op_add(self, params):
         """Add a torrent from raw .torrent bytes or a magnet URI."""
         save_path = params.get("savePath") or "."

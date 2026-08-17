@@ -209,3 +209,83 @@ class Problems(unittest.TestCase):
             self.assertEqual(sidecar._problem(Friendly()), "Friendly: disk full")
         finally:
             sidecar._PROBLEM_ALERTS = original
+
+
+class Reachability(unittest.TestCase):
+    """Whether peers can open a connection to this node, or only the reverse.
+
+    A node nothing can reach still downloads and still uploads -- it dials out
+    and works -- so none of its own traffic reveals that half the swarm can
+    never start a conversation with it. The cost is invisible and permanent.
+    """
+
+    class FakeSession:
+        def __init__(self, listening=True, port=6881, stats=None):
+            self._listening = listening
+            self._port = port
+            self._stats = stats or {}
+
+        def is_listening(self):
+            return self._listening
+
+        def listen_port(self):
+            return self._port
+
+    def instance(self, session, stats):
+        obj = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        obj._session = session
+        obj._session_stats = lambda: stats
+        return obj
+
+    def test_open_once_something_has_connected_inward(self):
+        s = self.FakeSession()
+        got = sidecar.Sidecar.op_reachability(
+            self.instance(s, {"net.has_incoming_connections": 1,
+                              "peer.incoming_connections": 4}),
+            {},
+        )
+        self.assertEqual(got["state"], "open")
+        self.assertEqual(got["incomingConnections"], 4)
+        self.assertEqual(got["port"], 6881)
+
+    def test_unproven_while_listening_with_nothing_inbound(self):
+        # Not "firewalled": on a node no peer has tried, blocked and untried
+        # are the same observation.
+        got = sidecar.Sidecar.op_reachability(
+            self.instance(self.FakeSession(), {"net.has_incoming_connections": 0}),
+            {},
+        )
+        self.assertEqual(got["state"], "unproven")
+        self.assertTrue(got["listening"])
+
+    def test_offline_when_not_listening(self):
+        got = sidecar.Sidecar.op_reachability(
+            self.instance(self.FakeSession(listening=False),
+                          {"net.has_incoming_connections": 1}),
+            {},
+        )
+        # Not listening outranks a stale gauge: there is no socket to reach.
+        self.assertEqual(got["state"], "offline")
+        self.assertIsNone(got["port"])
+
+    def test_missing_counters_read_as_nothing_inbound(self):
+        got = sidecar.Sidecar.op_reachability(
+            self.instance(self.FakeSession(), {}), {}
+        )
+        self.assertEqual(got["state"], "unproven")
+        self.assertEqual(got["incomingConnections"], 0)
+
+    def test_the_counters_it_reads_exist_in_this_libtorrent(self):
+        # Named strings against a real library: a rename upstream would
+        # otherwise read as "nothing has ever connected" for ever.
+        names = {m.name for m in lt.session_stats_metrics()}
+        for wanted in ("net.has_incoming_connections",
+                       "peer.incoming_connections",
+                       "peer.num_peers_connected"):
+            self.assertIn(wanted, names)
+
+    def test_the_session_answers_listen_state_directly(self):
+        ses = lt.session({"listen_interfaces": "127.0.0.1:0",
+                          "enable_dht": False, "enable_lsd": False})
+        self.assertTrue(hasattr(ses, "is_listening"))
+        self.assertTrue(hasattr(ses, "listen_port"))
