@@ -289,3 +289,85 @@ class Reachability(unittest.TestCase):
                           "enable_dht": False, "enable_lsd": False})
         self.assertTrue(hasattr(ses, "is_listening"))
         self.assertTrue(hasattr(ses, "listen_port"))
+
+
+class Recheck(unittest.TestCase):
+    """Hashing what is on disk when the record and the disk disagree.
+
+    Every other answer about how much of an archive is present is derived from
+    something written down earlier. This is the one that goes and looks.
+    """
+
+    class FakeHandle:
+        def __init__(self, paused=False, raises=None):
+            self.rechecked = False
+            self.resumed = False
+            self._paused = paused
+            self._raises = raises
+
+        def force_recheck(self):
+            if self._raises:
+                raise self._raises
+            self.rechecked = True
+
+        def flags(self):
+            return lt.torrent_flags.paused if self._paused else 0
+
+        def resume(self):
+            self.resumed = True
+
+    def instance(self, handle):
+        obj = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        obj._handle = lambda _hash: handle
+        return obj
+
+    def test_rechecks_the_named_torrent(self):
+        handle = self.FakeHandle()
+        got = sidecar.Sidecar.op_recheck(
+            self.instance(handle), {"infoHash": "a" * 40}
+        )
+        self.assertTrue(handle.rechecked)
+        self.assertTrue(got["rechecking"])
+
+    def test_resumes_a_paused_torrent_so_the_check_actually_runs(self):
+        # A paused torrent does not check. Reporting success for a check that
+        # never ran is the one outcome worse than refusing.
+        handle = self.FakeHandle(paused=True)
+        got = sidecar.Sidecar.op_recheck(
+            self.instance(handle), {"infoHash": "a" * 40}
+        )
+        self.assertTrue(handle.resumed)
+        self.assertTrue(got["wasPaused"])
+
+    def test_leaves_a_running_torrent_alone(self):
+        handle = self.FakeHandle(paused=False)
+        got = sidecar.Sidecar.op_recheck(
+            self.instance(handle), {"infoHash": "a" * 40}
+        )
+        self.assertFalse(handle.resumed)
+        self.assertFalse(got["wasPaused"])
+
+    def test_a_failure_is_reported_rather_than_swallowed(self):
+        handle = self.FakeHandle(raises=RuntimeError("no such torrent"))
+        with self.assertRaises(RuntimeError):
+            sidecar.Sidecar.op_recheck(
+                self.instance(handle), {"infoHash": "a" * 40}
+            )
+
+    def test_the_handle_really_has_this_method(self):
+        # Against the installed bindings: a fake handle proves the branch, not
+        # that libtorrent offers the operation the branch calls.
+        ses = lt.session({"listen_interfaces": "127.0.0.1:0",
+                          "enable_dht": False, "enable_lsd": False})
+        self.assertTrue(hasattr(lt.torrent_handle, "force_recheck"))
+        self.assertTrue(hasattr(lt.torrent_handle, "resume"))
+        del ses
+
+    def test_checking_is_a_state_the_read_path_already_waits_on(self):
+        # The recheck returns immediately and the caller watches for this
+        # state. If it were not in UNREADY_STATES a read during a recheck
+        # would be answered from an index that is momentarily empty.
+        self.assertIn(lt.torrent_status.checking_files, sidecar.UNREADY_STATES)
+        self.assertEqual(
+            sidecar.STATE_MAP[lt.torrent_status.checking_files], "checking"
+        )

@@ -10,6 +10,32 @@
 
 - _...Add new stuff here..._
 
+## 0.5.1
+
+### ✨ Features and improvements
+
+- **A `recheck` op, for when the record and the disk disagree.** Every other answer about how much
+  of an archive is present is derived from something written down earlier: resume data, or the
+  `seed_mode` claim made when it was added. Both can be wrong -- a file replaced underneath the
+  session, resume data from a build that was interrupted, a `seed_mode` claim for data that is not
+  at the save path -- and when they are, nothing recovers on its own. The torrent sits at 0% beside
+  a complete file, downloading what it already has.
+
+  `force_recheck` is the one operation that goes and looks: it discards the stored state, hashes
+  every piece against the torrent, and what it finds becomes the truth. A paused torrent is resumed
+  first, because a paused torrent does not check and reporting success for a check that never ran
+  is worse than refusing.
+
+  Returns as soon as the check is under way rather than waiting for it. A planet archive is tens of
+  minutes of disk, which is longer than any sane request timeout; the state to watch is `checking`,
+  and progress during it is the fraction hashed.
+
+- _...Add new stuff here..._
+
+### 🐞 Bug fixes
+
+- _...Add new stuff here..._
+
 ## 0.5.0
 
 ### ✨ Features and improvements

@@ -528,6 +528,43 @@ class Sidecar:
             self._handles.pop(params["infoHash"], None)
         return {"removed": True}
 
+    def op_recheck(self, params):
+        """Hash what is on disk again and believe the result over the record.
+
+        Every other answer about how much of an archive is here is derived from
+        something that was written down earlier: resume data, or the seed_mode
+        claim made when it was added. Both can be wrong -- a file replaced
+        underneath the session, resume data from a build that was interrupted,
+        a seed_mode claim for data that is not actually at the save path -- and
+        when they are, nothing recovers on its own. The torrent sits at 0% next
+        to a complete file, downloading what it already has.
+
+        force_recheck is the one operation that goes and looks. It drops the
+        stored state, hashes every piece against the torrent, and what it finds
+        becomes the truth.
+
+        Returns immediately rather than waiting for the hash to finish: a
+        planet archive is tens of minutes of disk, which is longer than any
+        sane request timeout. The state to watch is `checking`, and progress
+        during it is the fraction hashed.
+        """
+        handle = self._handle(params["infoHash"])
+        # Resume data describes the state being discarded, so keeping it would
+        # let a restart mid-check restore exactly the figures being rechecked.
+        try:
+            handle.force_recheck()
+        except Exception as error:  # pragma: no cover - libtorrent surface
+            raise RuntimeError(f"could not recheck: {error}") from error
+
+        # A paused torrent does not check. Resuming is what the caller asked
+        # for in substance -- "go and verify this" -- and leaving it paused
+        # would report success for something that never ran.
+        was_paused = bool(handle.flags() & lt.torrent_flags.paused)
+        if was_paused:
+            handle.resume()
+
+        return {"rechecking": True, "wasPaused": was_paused}
+
     def op_list(self, _params):
         """Report the state of every torrent in the session."""
         return [self._status(h) for h in self._session.get_torrents()]
