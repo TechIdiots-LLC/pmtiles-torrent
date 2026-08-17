@@ -1,10 +1,16 @@
 # pmtiles-torrent changelog
 
 ## master
+### ✨ Features and improvements
+- _...Add new stuff here..._
+
+### 🐞 Bug fixes
+- _...Add new stuff here..._
+
+## 0.7.0
 
 ### ✨ Features and improvements
 
-- _...Add new stuff here..._
 
 ### 🐞 Bug fixes
 
@@ -92,7 +98,6 @@
 
 ### ✨ Features and improvements
 
-- _...Add new stuff here..._
 
 ### 🐞 Bug fixes
 
@@ -110,7 +115,6 @@
   discarding it there would turn every pause into a full re-hash, which on an 800 GB archive is half
   an hour of disk to rediscover what was already known.
 
-- _...Add new stuff here..._
 
 ## 0.5.1
 
@@ -132,11 +136,9 @@
   minutes of disk, which is longer than any sane request timeout; the state to watch is `checking`,
   and progress during it is the fraction hashed.
 
-- _...Add new stuff here..._
 
 ### 🐞 Bug fixes
 
-- _...Add new stuff here..._
 
 ## 0.5.0
 
