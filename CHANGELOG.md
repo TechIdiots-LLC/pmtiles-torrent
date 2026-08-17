@@ -10,6 +10,30 @@
 
 - _...Add new stuff here..._
 
+## 0.5.2
+
+### ✨ Features and improvements
+
+- _...Add new stuff here..._
+
+### 🐞 Bug fixes
+
+- **Removing a torrent with its data now removes its resume file too.** Resume data describes what
+  is on disk for a torrent, and it was outliving the data it described. Delete an archive to
+  re-fetch it and the record of the old complete file stayed behind, so the re-add handed libtorrent
+  a description of a finished 698 GiB archive against a path holding a fresh partial one. libtorrent
+  answered with `fastresume_rejected` -- "mismatching file size" -- and set about rechecking, and
+  until that settled the torrent held no verified pieces. The visible result was bytes arriving at
+  10 MiB/s against a verified-piece count stuck at 1, and every tile read being told, honestly, that
+  the piece it wanted was not in the slot list.
+
+  Only when the data goes with it. A removal that keeps the files is how a pause is expressed for an
+  engine that has no pause of its own, and the resume file is exactly what makes resuming cheap --
+  discarding it there would turn every pause into a full re-hash, which on an 800 GB archive is half
+  an hour of disk to rediscover what was already known.
+
+- _...Add new stuff here..._
+
 ## 0.5.1
 
 ### ✨ Features and improvements

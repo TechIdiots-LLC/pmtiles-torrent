@@ -520,13 +520,48 @@ class Sidecar:
             time.sleep(1)
 
     def op_remove(self, params):
-        """Remove a torrent, optionally deleting its data."""
+        """Remove a torrent, optionally deleting its data and its resume file.
+
+        Resume data describes what is on disk for this torrent. Delete the
+        data and it describes nothing -- but it outlives the removal, so
+        re-adding the same infohash later hands libtorrent a record of a
+        complete archive and a path holding a fresh partial one. It answers
+        that with fastresume_rejected ("mismatching file size") and rechecks,
+        and until that settles the torrent holds no verified pieces, so every
+        read is honestly told the piece it wants is not in the slot list.
+        Observed in the field after deleting an archive to re-fetch it: bytes
+        arriving at 10 MiB/s against a verified-piece count stuck at 1.
+
+        Only when the data goes with it. A removal that keeps the files is how
+        a pause is expressed for an engine with no pause of its own, and the
+        resume file is exactly what makes resuming cheap -- discarding it there
+        would turn every pause into a full re-hash, which on an 800 GB archive
+        is half an hour of disk to rediscover what was already known.
+        """
         handle = self._handle(params["infoHash"])
-        flags = lt.options_t.delete_files if params.get("deleteData") else 0
+        delete_data = bool(params.get("deleteData"))
+        flags = lt.options_t.delete_files if delete_data else 0
         self._session.remove_torrent(handle, flags)
         with self._lock:
             self._handles.pop(params["infoHash"], None)
-        return {"removed": True}
+
+        resume_removed = False
+        if delete_data:
+            path = self._resume_path(params["infoHash"])
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+                    resume_removed = True
+            except OSError as error:
+                # Reported, not raised: the torrent is already gone from the
+                # session, and failing the removal over a leftover file would
+                # leave the caller believing nothing happened.
+                sys.stderr.write(
+                    f"[sidecar] could not delete resume data {path}: {error}\n"
+                )
+                sys.stderr.flush()
+
+        return {"removed": True, "resumeRemoved": resume_removed}
 
     def op_recheck(self, params):
         """Hash what is on disk again and believe the result over the record.

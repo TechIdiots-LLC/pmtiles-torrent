@@ -20,6 +20,8 @@ Run with `python test/test_sidecar_read_piece.py` (stdlib unittest, no pytest).
 
 import os
 import sys
+import tempfile
+import threading
 import time
 import unittest
 
@@ -371,3 +373,75 @@ class Recheck(unittest.TestCase):
         self.assertEqual(
             sidecar.STATE_MAP[lt.torrent_status.checking_files], "checking"
         )
+
+
+class RemoveClearsResume(unittest.TestCase):
+    """Resume data must not outlive the data it describes.
+
+    Deleting an archive and re-fetching it left the old resume file in place,
+    so the re-add handed libtorrent a record of a complete 698 GiB file against
+    a path holding a fresh partial one. libtorrent answered with
+    fastresume_rejected ("mismatching file size") and rechecked, and until that
+    settled nothing was verified -- bytes arriving at full speed against a
+    verified-piece count stuck at 1, and every read told the piece was not in
+    the slot list.
+    """
+
+    class FakeSession:
+        def __init__(self):
+            self.removed = []
+
+        def remove_torrent(self, handle, flags):
+            self.removed.append((handle, flags))
+
+    def instance(self, resume_dir):
+        obj = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        obj._session = self.FakeSession()
+        obj._resume_dir = resume_dir
+        obj._handles = {"a" * 40: object()}
+        obj._lock = threading.Lock()
+        obj._handle = lambda _hash: obj._handles["a" * 40]
+        return obj
+
+    def resume_file(self, directory):
+        path = os.path.join(directory, f"{'a' * 40}.resume")
+        with open(path, "wb") as handle:
+            handle.write(b"stale")
+        return path
+
+    def test_deleting_the_data_deletes_the_record_of_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.resume_file(directory)
+            got = sidecar.Sidecar.op_remove(
+                self.instance(directory), {"infoHash": "a" * 40, "deleteData": True}
+            )
+            self.assertFalse(os.path.exists(path))
+            self.assertTrue(got["resumeRemoved"])
+
+    def test_keeping_the_data_keeps_the_record(self):
+        # A removal that keeps the files is how a pause is expressed for an
+        # engine with no pause of its own. Discarding resume data there turns
+        # every pause into a full re-hash.
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.resume_file(directory)
+            got = sidecar.Sidecar.op_remove(
+                self.instance(directory), {"infoHash": "a" * 40, "deleteData": False}
+            )
+            self.assertTrue(os.path.exists(path))
+            self.assertFalse(got["resumeRemoved"])
+
+    def test_a_missing_resume_file_is_not_a_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            got = sidecar.Sidecar.op_remove(
+                self.instance(directory), {"infoHash": "a" * 40, "deleteData": True}
+            )
+            self.assertTrue(got["removed"])
+            self.assertFalse(got["resumeRemoved"])
+
+    def test_the_torrent_still_goes_when_there_is_no_resume_dir(self):
+        obj = self.instance(None)
+        got = sidecar.Sidecar.op_remove(
+            obj, {"infoHash": "a" * 40, "deleteData": True}
+        )
+        self.assertTrue(got["removed"])
+        self.assertEqual(len(obj._session.removed), 1)
