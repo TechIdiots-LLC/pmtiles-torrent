@@ -7,6 +7,33 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.7.2
+### ✨ Features and improvements
+
+### 🐞 Bug fixes
+- **`libtorrent list timed out after 60000ms`, on a node that was otherwise working.** Seeding,
+  downloading and tile reads all carried on; only the console could not be told about them, so its
+  header sat at "connecting…" and clicking an archive never loaded its details. 0.7.0 and 0.7.1
+  both aimed at this and neither reached it, because the cost was not in the request loop.
+
+  It was in how a listing was assembled. Reading one torrent's state costs a blocking round-trip to
+  libtorrent's session thread, and the listing did three per torrent — `status()`, `flags()` and
+  `torrent_file()` — so twenty archives cost sixty, each queued behind whatever that one thread was
+  doing. Measured on a real session holding twenty torrents: 0.66ms idle, and **1001ms** with the
+  session thread busy hashing. Same torrents, same work, 1500× the wait — and a slow disk under a
+  698 GiB hash is far past that. The disk was never the whole story; a multiplier of sixty was.
+
+  So nothing asks any more. `post_torrent_updates()` is asynchronous — it queues a message and
+  returns — and the session answers with one alert describing every torrent that changed. The alert
+  pump keeps a dictionary of rendered states current, and `list` reads that dictionary. Every field
+  came off the status object all along, including the two that were being fetched from the handle
+  separately. Listing now cannot block on the session at all, which is the point: the console keeps
+  working while the session thread is busy. Figures are at most a second old.
+
+  Held to by a test that swaps the session for one that raises on any call and asserts the listing
+  still answers. `get_torrent_status()`, the other batched route, is not usable from these bindings
+  — it invokes the Python predicate on libtorrent's thread without the GIL, and segfaults.
+
 ## 0.7.1
 ### ✨ Features and improvements
 

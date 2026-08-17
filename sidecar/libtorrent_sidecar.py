@@ -65,6 +65,27 @@ STATE_MAP = {
 # reason to treat this window differently from the rest of the file.
 HEAD_BYTES = 16384
 
+# How often the session is asked to describe every torrent it holds.
+#
+# One asynchronous request per interval, answered by an alert. Nothing waits on
+# it, so the cost of a shorter interval is a message and a dictionary write.
+STATUS_INTERVAL = 1.0
+
+# How long a cached snapshot may go unrefreshed before it is worth saying so.
+#
+# Serving a stale figure beats failing the call, but silence would hide a
+# session thread that has stopped answering altogether -- which is the fault
+# this cache exists to survive, and still worth knowing about.
+STATUS_STALE_AFTER = 30.0
+
+# How long a listing waits for a torrent it knows about but has no state for.
+#
+# Paid only while an archive added moments ago is still undescribed: reporting
+# an empty library because the answer was 40ms away would read as data loss.
+# Nothing here waits on libtorrent, so a session too busy to answer costs this
+# once rather than blocking the listing behind it.
+STATUS_WAIT = 5.0
+
 
 # Alerts that explain why a read failed rather than merely reporting progress.
 #
@@ -401,6 +422,28 @@ class Sidecar:
         self._subscribers = []
         self._subscriber_lock = threading.Lock()
         self._stop = threading.Event()
+
+        # Every torrent's state, kept current by the pump.
+        #
+        # Reading a torrent's state costs a blocking round-trip to libtorrent's
+        # session thread -- and status(), flags() and torrent_file() are three
+        # of them, so describing twenty archives cost sixty. Every one of those
+        # queued behind whatever the session thread was doing, so a session busy
+        # hashing a large archive turned a listing into a minute of waiting and
+        # the caller gave up: "libtorrent list timed out after 60000ms", over
+        # and over, on a node that was otherwise working.
+        #
+        # So nothing asks any more. post_torrent_updates() is asynchronous --
+        # it queues a message and returns -- and the session answers with one
+        # alert describing everything that changed. Listing then reads a
+        # dictionary and cannot block on the session at all, which is the point:
+        # the console keeps working while the session thread is busy.
+        self._statuses = {}
+        self._status_lock = threading.Lock()
+        self._status_at = 0.0
+        self._status_asked = 0.0
+        self._stale_reported = False
+
         # Said once per distinct fault, here rather than in whoever happened to
         # be waiting. A full disk outlives the read that noticed it, and used
         # to be reported only if a read was outstanding at the time.
@@ -414,11 +457,13 @@ class Sidecar:
         """Pops the session's alerts and hands each to whoever wants it."""
         while not self._stop.is_set():
             try:
+                self._ask_for_statuses()
                 self._session.wait_for_alert(500)
                 alerts = self._session.pop_alerts()
             except Exception:  # noqa: BLE001 - a dying session must not spin
                 return
             for alert in alerts:
+                self._absorb_status(alert)
                 note = _problem(alert)
                 if note is not None:
                     with self._subscriber_lock:
@@ -456,6 +501,90 @@ class Sidecar:
         finally:
             with self._subscriber_lock:
                 self._subscribers.remove(subscription)
+
+    # ---- the status cache -----------------------------------------------
+
+    def _ask_for_statuses(self):
+        """Asks the session to describe whatever has changed. Does not wait."""
+        now = time.monotonic()
+        if now - self._status_asked < STATUS_INTERVAL:
+            return
+        self._status_asked = now
+        try:
+            self._session.post_torrent_updates()
+        except Exception:  # noqa: BLE001 - a dying session must not spin
+            pass
+
+    def _absorb_status(self, alert):
+        """Files a state_update_alert, or forgets a torrent that has gone.
+
+        Runs on the pump thread, and renders each torrent to a plain dictionary
+        there. That is not incidental: the statuses belong to the alert, which
+        libtorrent frees on the next pop_alerts(), so keeping one to read later
+        is a use-after-free. See _Subscription.
+        """
+        if isinstance(alert, lt.state_update_alert):
+            fresh = {}
+            for status in alert.status:
+                rendered = self._render(status)
+                if rendered.get("infoHash"):
+                    fresh[rendered["infoHash"]] = rendered
+            with self._status_lock:
+                self._statuses.update(fresh)
+                self._status_at = time.monotonic()
+                self._stale_reported = False
+        elif isinstance(alert, lt.torrent_removed_alert):
+            self._forget(_v1_of(alert))
+
+    def _forget(self, info_hash):
+        """Drops a torrent, so a removal is neither listed nor waited for.
+
+        Both registries, always together. A listing waits for the cache to
+        describe every torrent in _handles, so an entry left in one and not the
+        other is not a stale line in the console -- it is every later listing
+        paying the full STATUS_WAIT for a torrent that will never be described.
+        """
+        if not info_hash:
+            return
+        with self._lock:
+            self._handles.pop(info_hash, None)
+        with self._status_lock:
+            self._statuses.pop(info_hash, None)
+
+    def _cached_statuses(self):
+        """Every torrent's last known state, once the cache covers them all.
+
+        An archive added a moment ago has not been described yet, and returning
+        the listing without it would read as the add having failed -- the caller
+        adds and then lists to confirm. So the cache is compared against the
+        torrents this sidecar knows it added, which is a dictionary lookup and
+        asks libtorrent nothing, and the gap is waited out up to STATUS_WAIT.
+        """
+        deadline = time.monotonic() + STATUS_WAIT
+        while True:
+            with self._lock:
+                expected = set(self._handles)
+            with self._status_lock:
+                snapshot = list(self._statuses.values())
+                described = set(self._statuses)
+                age = time.monotonic() - self._status_at if self._status_at else None
+            if expected <= described or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+
+        with self._status_lock:
+            stale = age is not None and age > STATUS_STALE_AFTER
+            say = stale and not self._stale_reported
+            if say:
+                self._stale_reported = True
+
+        if say:
+            sys.stderr.write(
+                f"[sidecar] session has not reported for {age:.0f}s; "
+                "listing what was last known\n"
+            )
+            sys.stderr.flush()
+        return snapshot
 
     # ---- operations -----------------------------------------------------
 
@@ -640,6 +769,14 @@ class Sidecar:
         info_hash = _v1_of(handle)
         with self._lock:
             self._handles[info_hash] = handle
+
+        # Describe it now rather than at the next tick, so the archive appears
+        # in the listing the caller is about to make. Asynchronous, like the
+        # periodic request -- it queues an alert and returns.
+        try:
+            handle.post_status()
+        except Exception:  # noqa: BLE001 - the tick will pick it up regardless
+            pass
         return {"infoHash": info_hash}
 
     def _prioritise_when_ready(self, handle, cache_mode, head_bytes, timeout=300):
@@ -735,8 +872,9 @@ class Sidecar:
         delete_data = bool(params.get("deleteData"))
         flags = lt.options_t.delete_files if delete_data else 0
         self._session.remove_torrent(handle, flags)
-        with self._lock:
-            self._handles.pop(params["infoHash"], None)
+        # Dropped here as well as on torrent_removed_alert, so the listing that
+        # follows the removal cannot still show it.
+        self._forget(params["infoHash"])
 
         resume_removed = False
         if delete_data:
@@ -794,13 +932,27 @@ class Sidecar:
         return {"rechecking": True, "wasPaused": was_paused}
 
     def op_list(self, _params):
-        """Report the state of every torrent in the session."""
-        return [self._status(h) for h in self._session.get_torrents()]
+        """Report the state of every torrent in the session.
+
+        Read from the cache the pump keeps, so this never waits on libtorrent's
+        session thread -- see _statuses for why it used to, and what that cost.
+        The figures are at most a second old.
+        """
+        return self._cached_statuses()
 
     def op_get(self, params):
         """Report one torrent's state."""
+        info_hash = params["infoHash"]
+        with self._status_lock:
+            cached = self._statuses.get(info_hash)
+        if cached is not None:
+            return cached
+
+        # Not described yet: added moments ago, or added while the session was
+        # too busy to answer. One torrent is one round-trip, which is a cost
+        # worth paying to avoid reporting a real archive as missing.
         try:
-            return self._status(self._handle(params["infoHash"]))
+            return self._status(self._handle(info_hash))
         except KeyError:
             return None
 
@@ -1386,17 +1538,34 @@ class Sidecar:
         return handle
 
     def _status(self, handle):
-        s = handle.status()
+        """One torrent's state, asked for directly.
 
+        Costs a round-trip to the session thread, so it is only for the torrent
+        the cache has never been told about. Everything else reads _statuses.
+        """
+        return self._render(handle.status())
+
+    def _render(self, s):
+        """A torrent_status as the wire describes it.
+
+        Takes the status rather than the handle. Every field below comes off the
+        one snapshot, including the two that used to be fetched separately:
+        `flags` carries what handle.flags() would have said, and `torrent_file`
+        is the same metadata handle.torrent_file() would have returned. Asking
+        the handle for them cost two more blocking round-trips per torrent, and
+        bought nothing -- the values are identical.
+        @param s: A torrent_status, from a handle or from a state_update_alert.
+        """
         # torrent_status.paused is deprecated in libtorrent 2.x and reports
-        # unreliably; the live value lives on the handle's flags.
-        paused = bool(handle.flags() & lt.torrent_flags.paused)
+        # unreliably; the live value is the paused bit of the status flags.
+        paused = bool(s.flags & lt.torrent_flags.paused)
 
         # A torrent whose files are all priority 0 is in cache mode: joined and
         # seeding whatever it holds, but fetching nothing on its own. Reporting
         # that as "paused" would be misleading — it is working as intended.
         has_metadata = s.has_metadata
         cache_mode = has_metadata and s.total_wanted == 0
+        info = getattr(s, "torrent_file", None) if has_metadata else None
 
         if paused:
             state = "paused"
@@ -1411,15 +1580,15 @@ class Sidecar:
         # archive actually held is the honest answer, and is the same quantity
         # the piece view already draws.
         progress = s.progress
-        if cache_mode:
-            total_pieces = handle.torrent_file().num_pieces()
+        if cache_mode and info is not None:
+            total_pieces = info.num_pieces()
             progress = (s.num_pieces / total_pieces) if total_pieces else 0.0
 
         return {
-            "infoHash": _v1_of(handle),
+            "infoHash": _v1_of(s),
             "name": s.name,
             # total_wanted is zero in cache mode, so report the real size.
-            "size": handle.torrent_file().total_size() if has_metadata else s.total_wanted,
+            "size": info.total_size() if info is not None else s.total_wanted,
             "progress": progress,
             "state": state,
             # Connected clients, not swarm size — and never this one, since a

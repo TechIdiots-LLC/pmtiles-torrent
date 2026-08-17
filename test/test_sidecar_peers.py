@@ -238,6 +238,11 @@ class FakeStatus:
 
     def __init__(self, **fields):
         self.has_metadata = True
+        # Both live on the real torrent_status, and both used to be fetched
+        # from the handle instead -- a blocking round-trip each.
+        self.info_hash = "a" * 40
+        self.torrent_file = FakeInfo()
+        self.flags = 0
         self.name = "planet-260803.osm.pbf"
         self.total_wanted = 0
         self.progress = 1.0
@@ -492,14 +497,21 @@ class HybridTorrentIdentity(unittest.TestCase):
         shutil.rmtree(cls.work, ignore_errors=True)
 
     def sidecar_instance(self):
-        """A sidecar over a real session, with nowhere to write resume data."""
-        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
-        instance._session = sidecar.lt.session(
-            {"listen_interfaces": "127.0.0.1:0", "enable_dht": False}
-        )
-        instance._lock = threading.Lock()
-        instance._handles = {}
-        instance._resume_dir = None
+        """A real sidecar on a local-only session, writing no resume data.
+
+        Built through the constructor rather than hollowed out with __new__,
+        because listing is answered from the cache the alert pump fills: a
+        sidecar without a running pump can add a torrent and then report an
+        empty library, which is precisely what these tests are checking.
+        """
+        instance = sidecar.Sidecar({
+            "listen": "127.0.0.1:0",
+            "dht": False,
+            "lsd": False,
+            "upnp": False,
+            "natpmp": False,
+        })
+        self.addCleanup(instance.op_shutdown, {})
         return instance
 
     def v1_of(self, torrent_file):

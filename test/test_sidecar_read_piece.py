@@ -396,6 +396,8 @@ class RemoveClearsResume(unittest.TestCase):
         obj._resume_dir = resume_dir
         obj._handles = {"a" * 40: object()}
         obj._lock = threading.Lock()
+        obj._statuses = {}
+        obj._status_lock = threading.Lock()
         obj._handle = lambda _hash: obj._handles["a" * 40]
         return obj
 
