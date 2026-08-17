@@ -463,20 +463,22 @@ class Sidecar:
             except Exception:  # noqa: BLE001 - a dying session must not spin
                 return
             for alert in alerts:
-                self._absorb_status(alert)
-                note = _problem(alert)
-                if note is not None:
+                # Guarded per alert. This thread is the only one delivering
+                # alerts and the only one keeping the status cache current, so
+                # an exception escaping here does not cost one alert -- it ends
+                # piece reads, status updates and fault reporting together, and
+                # says nothing on the way out.
+                try:
+                    self._absorb_status(alert)
+                    note = _problem(alert)
+                    if note is not None:
+                        self._say_once(note)
                     with self._subscriber_lock:
-                        fresh = note not in self._reported
-                        if fresh:
-                            self._reported.add(note)
-                    if fresh:
-                        sys.stderr.write(f"[sidecar] {note}\n")
-                        sys.stderr.flush()
-                with self._subscriber_lock:
-                    subscribers = list(self._subscribers)
-                for subscriber in subscribers:
-                    subscriber.offer(alert)
+                        subscribers = list(self._subscribers)
+                    for subscriber in subscribers:
+                        subscriber.offer(alert)
+                except Exception as error:  # noqa: BLE001 - as above
+                    self._say_once(f"could not deliver an alert: {error}")
 
     @contextlib.contextmanager
     def _subscribe(self, wanted, capture):
@@ -526,7 +528,15 @@ class Sidecar:
         if isinstance(alert, lt.state_update_alert):
             fresh = {}
             for status in alert.status:
-                rendered = self._render(status)
+                try:
+                    rendered = self._render(status)
+                except Exception as error:  # noqa: BLE001 - see below
+                    # One unrenderable torrent must not stop the pump. This is
+                    # called outside the loop's own guard, so an exception here
+                    # ends the thread -- and a dead pump takes alert delivery,
+                    # every piece read and the status cache with it, silently.
+                    self._say_once(f"could not describe a torrent: {error}")
+                    continue
                 if rendered.get("infoHash"):
                     fresh[rendered["infoHash"]] = rendered
             with self._status_lock:
@@ -534,22 +544,52 @@ class Sidecar:
                 self._status_at = time.monotonic()
                 self._stale_reported = False
         elif isinstance(alert, lt.torrent_removed_alert):
-            self._forget(_v1_of(alert))
+            self._forget_status(_v1_of(alert))
+
+    def _forget_status(self, info_hash):
+        """Drops a cached status for a torrent that has left the session.
+
+        Only the cache, and only if the torrent really has gone. The alert
+        arrives well after the removal that caused it, and a re-add in between
+        is not unusual -- it is how the library is restored and how a mode
+        change is applied, both of which remove and immediately add back.
+
+        Dropping the handle here as well cost a production node its library.
+        The late alert deleted a registration made after it, and because
+        post_torrent_updates() reports only torrents that have *changed*, a
+        complete archive sitting there seeding was never described again: it
+        disappeared from every listing, permanently, while seeding perfectly
+        well. Only the idle ones went, which is what made it look like data
+        loss rather than a bug. op_remove drops the handle itself, at the
+        moment it removes the torrent, where there is nothing to race.
+        """
+        if not info_hash:
+            return
+        with self._lock:
+            if info_hash in self._handles:
+                # Removed and added back. The new registration stands.
+                return
+        with self._status_lock:
+            self._statuses.pop(info_hash, None)
 
     def _forget(self, info_hash):
-        """Drops a torrent, so a removal is neither listed nor waited for.
-
-        Both registries, always together. A listing waits for the cache to
-        describe every torrent in _handles, so an entry left in one and not the
-        other is not a stale line in the console -- it is every later listing
-        paying the full STATUS_WAIT for a torrent that will never be described.
-        """
+        """Drops a torrent outright, for a removal this sidecar performed."""
         if not info_hash:
             return
         with self._lock:
             self._handles.pop(info_hash, None)
         with self._status_lock:
             self._statuses.pop(info_hash, None)
+
+    def _say_once(self, note):
+        """Writes a line to stderr the first time this fault is seen."""
+        with self._subscriber_lock:
+            fresh = note not in self._reported
+            if fresh:
+                self._reported.add(note)
+        if fresh:
+            sys.stderr.write(f"[sidecar] {note}\n")
+            sys.stderr.flush()
 
     def _cached_statuses(self):
         """Every torrent's last known state, once the cache covers them all.
@@ -559,16 +599,35 @@ class Sidecar:
         adds and then lists to confirm. So the cache is compared against the
         torrents this sidecar knows it added, which is a dictionary lookup and
         asks libtorrent nothing, and the gap is waited out up to STATUS_WAIT.
+
+        Anything still missing is asked to describe itself, which is the part
+        that makes this safe rather than merely prompt. post_torrent_updates()
+        reports only torrents that have *changed*, so a complete archive that
+        sits there seeding is described once and then never again -- and a
+        cache that lost that one entry, however it lost it, would omit the
+        archive from every listing for as long as the process ran. Asking is
+        asynchronous and costs no round-trip, so a cache that falls behind
+        repairs itself instead of quietly reporting a smaller library.
         """
         deadline = time.monotonic() + STATUS_WAIT
+        asked = False
         while True:
             with self._lock:
-                expected = set(self._handles)
+                expected = dict(self._handles)
             with self._status_lock:
                 snapshot = list(self._statuses.values())
                 described = set(self._statuses)
                 age = time.monotonic() - self._status_at if self._status_at else None
-            if expected <= described or time.monotonic() >= deadline:
+
+            missing = set(expected) - described
+            if missing and not asked:
+                asked = True
+                for info_hash in missing:
+                    try:
+                        expected[info_hash].post_status()
+                    except Exception:  # noqa: BLE001 - the tick will do it
+                        pass
+            if not missing or time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
 
@@ -686,14 +745,29 @@ class Sidecar:
         # lookup was always for None and every restart re-checked everything.
         resume = self._read_resume(params.get("infoHash") or _identify(atp))
         if resume:
-            restored = lt.read_resume_data(resume)
-            # Resume data does not carry the metadata, so a .torrent add keeps
-            # the metainfo it already parsed. Without this a resumed torrent
-            # has no file list until it fetches one over BEP 9 — from a swarm,
-            # for a file already on the disk.
-            if atp.ti is not None:
-                restored.ti = atp.ti
-            atp = restored
+            # A resume file that cannot be parsed costs a recheck, not the
+            # archive. It used to raise straight out of the add, so restoring
+            # the library skipped that archive entirely: not in the session,
+            # absent from every listing, "no such torrent" from a recheck, and
+            # its data sitting on the disk in full the whole time. Rechecking
+            # a 657 GiB archive is slow, but it finds every byte that is there
+            # and nothing is downloaded again. See _write_resume, which is why
+            # a truncated one should no longer exist.
+            try:
+                restored = lt.read_resume_data(resume)
+            except Exception as error:  # noqa: BLE001 - any malformed file
+                self._say_once(
+                    f"resume data for {_identify(atp)} is unreadable ({error}); "
+                    "adding it anyway and rechecking what is on disk"
+                )
+            else:
+                # Resume data does not carry the metadata, so a .torrent add
+                # keeps the metainfo it already parsed. Without this a resumed
+                # torrent has no file list until it fetches one over BEP 9 —
+                # from a swarm, for a file already on the disk.
+                if atp.ti is not None:
+                    restored.ti = atp.ti
+                atp = restored
 
         # Applied after the resume swap, not before: read_resume_data returns a
         # fresh params object, so anything set earlier was thrown away. Cache
@@ -1624,11 +1698,32 @@ class Sidecar:
             return handle.read()
 
     def _write_resume(self, info_hash, params):
+        """Persists resume data, completely or not at all.
+
+        Written beside the target and renamed over it, because the old way --
+        opening the real path and writing into it -- leaves a truncated file
+        under the real name if the machine goes down mid-write. Resume data is
+        a piece bitfield, so the largest and most complete archives have the
+        largest files and the widest window, and this timer fires every few
+        minutes for every torrent at once.
+
+        What that cost: a truncated file makes read_resume_data raise, which
+        failed the whole add, so the archive was never put into the session at
+        all. It vanished from the console showing 0% and no state, a recheck
+        answered "no such torrent", and the data sat on disk untouched the
+        whole time. Seen in the field after a reboot, on the five largest
+        archives on the node. os.replace is atomic on both platforms, and the
+        fsync is what stops the rename reaching the disk before the bytes do.
+        """
         path = self._resume_path(info_hash)
         if not path:
             return
-        with open(path, "wb") as handle:
+        staging = f"{path}.new"
+        with open(staging, "wb") as handle:
             handle.write(lt.write_resume_data_buf(params))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staging, path)
 
 
 # Operations run off the reader loop, because they take long enough to starve

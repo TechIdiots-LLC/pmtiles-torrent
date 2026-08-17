@@ -7,6 +7,47 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.7.3
+### ✨ Features and improvements
+
+### 🐞 Bug fixes
+- **A reboot could take archives out of the session entirely, and they stayed out.** Reported from
+  the field: after a restart the five largest archives showed 0% and no state, a recheck answered
+  `no such torrent`, and their data was sitting on the disk in full the whole time — a preview
+  rendered from it perfectly well.
+
+  Resume data was written by opening the real path and writing into it, so a machine going down
+  mid-write left a truncated file under the real name. `read_resume_data` then raised straight out
+  of `add`, which failed the whole add, so restoring the library skipped that archive: never in the
+  session, absent from every listing, and nothing to recheck. Resume data is a piece bitfield, so
+  the largest and most complete archives have the biggest files and the widest window — which is
+  why it took the big ones and left the small, busy ones alone.
+
+  Both halves are fixed. Resume data is now written beside the target and renamed over it, with an
+  fsync so the rename cannot reach the disk before the bytes — `os.replace` is atomic on both
+  platforms, so an interrupted write leaves the previous good copy. And a resume file that cannot
+  be parsed now costs a recheck rather than the archive: the add proceeds without it, finds every
+  byte that is on disk, and downloads nothing again.
+
+- **A torrent removed and immediately added back could vanish from listings for good.**
+  `torrent_removed_alert` arrives well after the removal that caused it, and 0.7.2 dropped the
+  handle on that alert — landing on a registration made after it. Removing and re-adding is
+  ordinary: it is how a library is restored and how a mode change is applied.
+
+  What made it permanent rather than a flicker: `post_torrent_updates()` reports only torrents that
+  have *changed*, so a complete archive sitting there seeding is described once and never again.
+  The alert now drops only the cached status, and only when the torrent really has gone; `remove`
+  drops the handle itself, where there is nothing to race.
+
+- **A listing can no longer report a smaller library than the sidecar is holding.** The safety net
+  under the above, and the reason that bug could bite at all. Anything in the session with no
+  cached status is now asked to describe itself — asynchronously, so no round-trip — instead of
+  being silently omitted until something about it happens to change.
+
+- **One bad alert no longer kills the alert pump.** Absorbing an alert ran outside the pump loop's
+  own guard, so an exception ended the thread — taking piece reads, status updates and fault
+  reporting with it, silently.
+
 ## 0.7.2
 ### ✨ Features and improvements
 
