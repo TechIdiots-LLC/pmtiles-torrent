@@ -1037,6 +1037,10 @@ class Sidecar:
         # that is not writable and a torrent that cannot verify its pieces all
         # became the same silent timeout.
         problems = []
+        # The last thing libtorrent said about this piece, kept for the timeout
+        # message rather than raised the moment it arrives. See below.
+        refused = None
+        armed = time.time()
 
         while time.time() < timeout:
             alert = self._session.wait_for_alert(500)
@@ -1045,13 +1049,22 @@ class Sidecar:
             for item in self._session.pop_alerts():
                 if isinstance(item, lt.read_piece_alert) and item.piece == index:
                     if item.error.value() != 0:
-                        # Said with the torrent's state attached. libtorrent's
-                        # wording for these is terse and sometimes legacy, and
-                        # on its own gives a caller nothing to act on.
-                        raise RuntimeError(
-                            f"piece {index}: {item.error.message()}"
-                            f" ({self._describe(handle)}){_joined(problems)}"
-                        )
+                        # Not a failure. "I do not have that piece yet."
+                        #
+                        # alert_when_available asks libtorrent to read the piece
+                        # when it lands; a piece that is not here yet is read
+                        # immediately anyway and errors, typically "invalid
+                        # piece index in slot list". Raising on that abandoned
+                        # the deadline that had just been set -- so the read
+                        # both refused to wait and cancelled the fetch that
+                        # would have satisfied it. On a 698 GiB archive the head
+                        # was asked for every ten minutes and given up on within
+                        # milliseconds each time, for 200 GiB.
+                        #
+                        # The caller's timeout is the budget for waiting, and it
+                        # is already running. Keep it.
+                        refused = item.error.message()
+                        continue
                     return {"piece": index, "data": base64.b64encode(item.buffer).decode()}
 
                 note = _problem(item)
@@ -1064,6 +1077,19 @@ class Sidecar:
                     problems.append(note)
                     sys.stderr.write(f"[sidecar] {note}\n")
                     sys.stderr.flush()
+
+            # A refused read consumes the deadline's alert, so re-arm it or the
+            # piece lands and nothing says so. Paced: a piece that is not here
+            # yet refuses instantly, and re-arming on every refusal is a spin.
+            if refused is not None and time.time() - armed >= 1:
+                handle.piece_priority(index, 7)
+                handle.set_piece_deadline(
+                    index, deadline, lt.deadline_flags_t.alert_when_available
+                )
+                armed = time.time()
+
+        if refused is not None:
+            problems.append(f"last refusal: {refused}")
 
         raise TimeoutError(
             f"timed out waiting for piece {index}"

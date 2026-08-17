@@ -10,6 +10,23 @@
 
 - _...Add new stuff here..._
 
+## 0.6.1
+
+### 🐞 Bug fixes
+
+- **A read no longer cancels the fetch it just asked for.** `set_piece_deadline` with
+  `alert_when_available` asks libtorrent to read a piece when it lands — but a piece that is not
+  here yet gets read immediately anyway and errors, usually `invalid piece index in slot list`.
+  `read_piece` raised on that first errored alert, which meant it both refused to wait and
+  abandoned the deadline that would have satisfied it. So every attempt asked for the piece, was
+  told "not yet" within milliseconds, and gave up — the caller seeing an instant error rather than
+  a read in progress, and the piece never being hurried. On a 698 GiB archive with two complete
+  seeds connected, the head was requested every ten minutes and dropped every time, for 200 GiB of
+  downloading with the archive still unable to serve a tile. An errored alert is now recorded and
+  waited past, the deadline is re-armed (paced, since a missing piece refuses instantly), and the
+  caller's own timeout is what ends the wait — which is what the timeout was always for. The last
+  refusal is reported with the timeout when one happens.
+
 ## 0.6.0
 
 ### ✨ Features and improvements
