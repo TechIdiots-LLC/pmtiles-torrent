@@ -10,6 +10,33 @@
 
 - _...Add new stuff here..._
 
+## 0.6.0
+
+### ✨ Features and improvements
+
+- **The libtorrent sidecar now asks for an archive's head at add time, not only at first read.**
+  PMTiles v3 puts a 127-byte header at offset 0 and requires the root directory within the first
+  16,384 bytes; those few kilobytes name where every other section begins, so until they are local
+  no tile can be located, and once they are, any tile is one targeted range request away. Reads
+  already prioritise what they need — every piece fetch raises its piece to 7 with a deadline, the
+  header piece included — but that is reactive, and a reader has to exist. When a consumer wrongly
+  concluded an archive was already summarised and never issued the read, nothing raised the head
+  and the archive sat unservable with no signal that anything was wrong. `add` now raises the
+  pieces spanning the first 16 KiB itself, so the head is on its way whether or not anything asks,
+  and before the picker has committed to an order. The deadline is the part that matters: priority
+  7 promises only that a piece will not be skipped, never when. Cache mode is included — its file
+  priorities are 0 so nothing is fetched speculatively, but the head is not speculative — and a
+  magnet applies it once its metadata lands. `seedOnly` skips it, the bytes being local already.
+  Tunable with `headBytes`, and `prioritise_head` asks for the head of a torrent already added.
+
+### 🐞 Bug fixes
+
+- **Two thirds of the sidecar tests never ran when the file was run the way its own docstring says
+  to run it.** A `unittest.main()` block sat in the middle of the module rather than at the end, so
+  `python test/test_sidecar_read_piece.py` collected only the classes defined above it and reported
+  a confident OK for 10 of 32 tests. `npm run test:sidecar` imports the module and was unaffected,
+  which is why it went unnoticed.
+
 ## 0.5.2
 
 ### ✨ Features and improvements

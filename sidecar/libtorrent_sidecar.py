@@ -54,6 +54,16 @@ STATE_MAP = {
 }
 
 
+# What has to arrive before an archive can answer anything at all.
+#
+# PMTiles v3 puts a 127-byte header at offset 0 and requires the root directory
+# to lie within the first 16,384 bytes. Those bytes name where every other
+# section begins, so until they are here no tile can even be located; once they
+# are, any tile is one targeted range request away. That asymmetry is the whole
+# reason to treat this window differently from the rest of the file.
+HEAD_BYTES = 16384
+
+
 # Alerts that explain why a read failed rather than merely reporting progress.
 #
 # Named through getattr because the set differs across binding versions, and a
@@ -494,30 +504,109 @@ class Sidecar:
 
         handle = self._session.add_torrent(atp)
 
-        # A magnet has no metadata yet, so file priorities cannot be set until
-        # it arrives. Apply them once it does, otherwise a cache-mode magnet
-        # would quietly start downloading the whole archive.
-        if cache_mode and atp.ti is None:
+        # Fetch the head before anything asks for it.
+        #
+        # Nothing about this archive can be answered until the header and root
+        # directory are local, and they are a few kilobytes at a known offset.
+        # read_piece already prioritises whatever it is fetching, the header
+        # piece included, but only while a read is in flight -- so the head is
+        # hurried if and only if something chooses to read it. A consumer that
+        # wrongly believed an archive was already summarised issued no read at
+        # all, and the archive sat unservable with nothing to say why. Asking
+        # here costs one piece, depends on no reader, and lands before the
+        # picker has settled on an order.
+        #
+        # Seeding a local build needs none of this: the bytes are already here.
+        head_bytes = int(params.get("headBytes", HEAD_BYTES))
+        want_head = head_bytes > 0 and not params.get("seedOnly")
+
+        # A magnet has no metadata yet, so neither file priorities nor piece
+        # numbers exist to be set. Apply both once it arrives — otherwise a
+        # cache-mode magnet quietly downloads the whole archive, and the head
+        # of any magnet-added archive waits its turn like everything else.
+        if atp.ti is None and (cache_mode or want_head):
             threading.Thread(
-                target=self._deprioritise_when_ready, args=(handle,), daemon=True
+                target=self._prioritise_when_ready,
+                args=(handle, cache_mode, head_bytes if want_head else 0),
+                daemon=True,
             ).start()
+        elif want_head:
+            self._prioritise_head(handle, head_bytes)
 
         info_hash = _v1_of(handle)
         with self._lock:
             self._handles[info_hash] = handle
         return {"infoHash": info_hash}
 
-    def _deprioritise_when_ready(self, handle, timeout=300):
-        """Set every file to priority 0 once metadata arrives."""
+    def _prioritise_when_ready(self, handle, cache_mode, head_bytes, timeout=300):
+        """Apply add-time priorities once a magnet's metadata arrives."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if handle.has_metadata():
-                try:
-                    handle.prioritize_files([0] * handle.torrent_file().num_files())
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
+                if cache_mode:
+                    try:
+                        handle.prioritize_files(
+                            [0] * handle.torrent_file().num_files()
+                        )
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+                if head_bytes > 0:
+                    self._prioritise_head(handle, head_bytes)
                 return
             time.sleep(1)
+
+    def _prioritise_head(self, handle, head_bytes=HEAD_BYTES, file_index=0):
+        """
+        Raise the pieces holding the first `head_bytes` of the archive file.
+
+        Priority 7 alone only promises the piece will not be skipped; it says
+        nothing about when. set_piece_deadline is what actually reorders the
+        picker, and it is set here as well as in read_piece so the head is
+        already on its way before the first read rather than because of it.
+
+        Cache mode is included deliberately. Its file priorities are 0 so that
+        nothing is fetched speculatively, but the head is not speculative — it
+        is the one region every future read depends on, and it is one piece.
+
+        Best effort throughout: a torrent that vanishes between the add and
+        this call is not a reason to fail the add.
+        """
+        try:
+            if not handle.status().has_metadata:
+                return {"pieces": 0}
+            info = handle.torrent_file()
+            files = info.files()
+            if file_index >= info.num_files():
+                return {"pieces": 0}
+
+            start = files.file_offset(file_index)
+            # Clipped to the file: a small archive may be shorter than the head
+            # window, and a torrent holding more than one file must not spill
+            # the request into its neighbour.
+            span = min(head_bytes, files.file_size(file_index))
+            if span <= 0:
+                return {"pieces": 0}
+
+            piece_length = info.piece_length()
+            first = start // piece_length
+            last = (start + span - 1) // piece_length
+
+            for index in range(first, min(last, info.num_pieces() - 1) + 1):
+                handle.piece_priority(index, 7)
+                handle.set_piece_deadline(index, 0)
+            return {"pieces": last - first + 1, "first": first, "last": last}
+        except Exception as error:  # noqa: BLE001 - best effort
+            sys.stderr.write(f"[sidecar] could not prioritise head: {error}\n")
+            sys.stderr.flush()
+            return {"pieces": 0}
+
+    def op_prioritise_head(self, params):
+        """Ask for the head of an archive that is already added."""
+        handle = self._handle(params["infoHash"])
+        head_bytes = int(params.get("headBytes", HEAD_BYTES))
+        return self._prioritise_head(
+            handle, head_bytes, int(params.get("fileIndex", 0))
+        )
 
     def op_remove(self, params):
         """Remove a torrent, optionally deleting its data and its resume file.

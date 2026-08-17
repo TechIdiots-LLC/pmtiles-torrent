@@ -153,10 +153,6 @@ class UnreadyStates(unittest.TestCase):
         self.assertIn(lt.torrent_status.downloading_metadata, sidecar.UNREADY_STATES)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Problems(unittest.TestCase):
     """Reporting what libtorrent said, instead of discarding it.
 
@@ -445,3 +441,130 @@ class RemoveClearsResume(unittest.TestCase):
         )
         self.assertTrue(got["removed"])
         self.assertEqual(len(obj._session.removed), 1)
+
+
+class HeadPriority(unittest.TestCase):
+    """
+    Asking for the header before anything asks for a tile.
+
+    The bug this exists for: prioritising the head was reactive. read_piece
+    raises whatever it is fetching, the header piece included, so an archive
+    somebody reads gets its head hurried -- and an archive nobody reads does
+    not. A consumer that wrongly concluded an archive was already summarised
+    issued no read at all, and the archive sat unservable with nothing to
+    indicate why. Asking at add time costs one piece and depends on no reader.
+    """
+
+    class Files:
+        def __init__(self, offsets, sizes):
+            self._offsets = offsets
+            self._sizes = sizes
+
+        def file_offset(self, index):
+            return self._offsets[index]
+
+        def file_size(self, index):
+            return self._sizes[index]
+
+    class Info:
+        def __init__(self, piece_length, pieces, offsets, sizes):
+            self._piece_length = piece_length
+            self._pieces = pieces
+            self._files = HeadPriority.Files(offsets, sizes)
+
+        def piece_length(self):
+            return self._piece_length
+
+        def num_pieces(self):
+            return self._pieces
+
+        def num_files(self):
+            return len(self._files._offsets)
+
+        def files(self):
+            return self._files
+
+    class Handle:
+        def __init__(self, info, has_metadata=True):
+            self._info = info
+            self._status = FakeStatus(has_metadata=has_metadata)
+            self.priorities = {}
+            self.deadlines = {}
+
+        def status(self):
+            return self._status
+
+        def torrent_file(self):
+            return self._info
+
+        def piece_priority(self, index, priority):
+            self.priorities[index] = priority
+
+        def set_piece_deadline(self, index, deadline, flags=None):
+            self.deadlines[index] = deadline
+
+    def single(self, piece_length=16 * 1024 * 1024, length=698 * 1024**3):
+        pieces = -(-length // piece_length)
+        return self.Handle(self.Info(piece_length, pieces, [0], [length]))
+
+    def test_one_sixteen_mib_piece_covers_the_whole_head(self):
+        # The realistic case: piece 0 alone carries the header and the root
+        # directory, and it is the only piece that has to be hurried.
+        handle = self.single()
+        got = sidecar.Sidecar._prioritise_head(sidecar.Sidecar.__new__(sidecar.Sidecar), handle)
+        self.assertEqual(got["pieces"], 1)
+        self.assertEqual(handle.priorities, {0: 7})
+
+    def test_priority_alone_is_not_enough_so_a_deadline_goes_with_it(self):
+        # Priority 7 promises the piece will not be skipped and says nothing
+        # about when. set_piece_deadline is what reorders the picker, and its
+        # absence is the difference between "eventually" and "first".
+        handle = self.single()
+        sidecar.Sidecar._prioritise_head(sidecar.Sidecar.__new__(sidecar.Sidecar), handle)
+        self.assertEqual(handle.deadlines, {0: 0})
+
+    def test_a_small_piece_length_takes_every_piece_the_head_spans(self):
+        # 4 KiB pieces put the 16 KiB head across four of them. Hurrying only
+        # the first would leave the root directory truncated and unreadable.
+        handle = self.single(piece_length=4096, length=1024**3)
+        got = sidecar.Sidecar._prioritise_head(sidecar.Sidecar.__new__(sidecar.Sidecar), handle)
+        self.assertEqual(got["pieces"], 4)
+        self.assertEqual(sorted(handle.priorities), [0, 1, 2, 3])
+
+    def test_a_file_after_the_first_starts_at_its_own_offset(self):
+        # A multi-file torrent's archive does not begin at piece 0, and asking
+        # for piece 0 would hurry somebody else's bytes.
+        info = self.Info(4096, 100, [0, 40960], [40960, 40960])
+        handle = self.Handle(info)
+        got = sidecar.Sidecar._prioritise_head(
+            sidecar.Sidecar.__new__(sidecar.Sidecar), handle, 16384, 1
+        )
+        self.assertEqual(got["first"], 10)
+        self.assertEqual(sorted(handle.priorities), [10, 11, 12, 13])
+
+    def test_an_archive_smaller_than_the_head_window_is_clipped(self):
+        handle = self.single(piece_length=4096, length=8192)
+        got = sidecar.Sidecar._prioritise_head(sidecar.Sidecar.__new__(sidecar.Sidecar), handle)
+        self.assertEqual(got["pieces"], 2)
+
+    def test_a_torrent_without_metadata_yet_is_left_alone(self):
+        # Piece numbers do not exist yet. The magnet path retries once the
+        # metadata lands rather than guessing now.
+        handle = self.Handle(self.Info(4096, 100, [0], [40960]), has_metadata=False)
+        got = sidecar.Sidecar._prioritise_head(sidecar.Sidecar.__new__(sidecar.Sidecar), handle)
+        self.assertEqual(got["pieces"], 0)
+        self.assertEqual(handle.priorities, {})
+
+    def test_a_handle_that_throws_does_not_fail_the_add(self):
+        class Broken:
+            def status(self):
+                raise RuntimeError("torrent is gone")
+
+        got = sidecar.Sidecar._prioritise_head(
+            sidecar.Sidecar.__new__(sidecar.Sidecar), Broken()
+        )
+        self.assertEqual(got["pieces"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

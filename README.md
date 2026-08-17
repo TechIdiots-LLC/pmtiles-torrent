@@ -257,6 +257,14 @@ WebTorrent cannot:
 - **BitTorrent v2 (BEP 52)** — per-file merkle trees with 16 KiB leaf blocks, so a peer can verify
   a small block without holding the whole hash list. The right shape for random access.
 
+It also asks for the head of an archive the moment it is added. PMTiles v3 puts a 127-byte header
+at offset 0 and requires the root directory within the first 16,384 bytes; those few kilobytes say
+where every section begins, so until they are local no tile can even be located, and once they are,
+any tile is one targeted request away. Reads prioritise what they need, the header piece included,
+but only while a read is in flight — so an archive nothing happens to read stays unservable with
+nothing indicating why. Asking at add time costs one piece and does not depend on a reader. Pass
+`headBytes: 0` to turn it off; a `seedOnly` add skips it, the bytes being local already.
+
 ```ts
 import { LibtorrentEngine } from "pmtiles-torrent/libtorrent";
 
