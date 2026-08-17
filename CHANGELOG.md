@@ -7,6 +7,23 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.7.1
+### ✨ Features and improvements
+
+### 🐞 Bug fixes
+- **The alert pump added in 0.7.0 could crash the sidecar with SIGSEGV.** libtorrent owns its
+  alerts and frees them on the next `pop_alerts()`, so an alert object handed to another thread is
+  a pointer into memory the session is about to reuse. The pump queued the alert itself, and a
+  reader waits up to 500ms before looking at its queue while the pump pops about twice a second —
+  so the read was routinely of freed memory. That is not an exception, it is the process dying.
+  Confirmed against libtorrent 2.0.13: capture alerts, pop five more times, read one of the
+  captured ones, and the interpreter dies with a memory-corruption code.
+
+  A subscription now takes a snapshot on the pump's thread — the piece number, the refusal message,
+  and `bytes()` of the buffer rather than the binding's view of it — and queues that. Held to by a
+  test asserting nothing on a subscription queue is an alert, rather than by reproducing the crash,
+  since a test that segfaults takes the runner with it and reports nothing.
+
 ## 0.7.0
 
 ### ✨ Features and improvements

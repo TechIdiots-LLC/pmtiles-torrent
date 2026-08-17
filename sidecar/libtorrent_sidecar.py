@@ -331,17 +331,28 @@ class _Subscription:
     Holds a queue rather than a single slot because a read can care about more
     than one alert: the piece it is waiting for, and anything that explains why
     it is not coming.
+
+    What goes on the queue is a snapshot taken from the alert, never the alert.
+    libtorrent owns its alerts and frees them on the next pop_alerts(), so an
+    alert object handed to another thread is a pointer to memory the session is
+    about to reuse -- and reading it later is a use-after-free, which is a
+    SIGSEGV rather than an exception. Both halves of that matter here: the pump
+    pops roughly twice a second, and a reader waits up to 500ms before looking
+    at its queue, so the window is not a narrow one.
+
+    Both callbacks run on the pump thread while the alert is still valid.
     """
 
-    def __init__(self, wanted):
+    def __init__(self, wanted, capture):
         self.wanted = wanted
+        self.capture = capture
         self.queue = queue.Queue()
 
     def offer(self, alert):
-        """Takes a copy of the alert if it is one this caller asked for."""
+        """Snapshots the alert, on the pump's thread, if this caller asked for it."""
         try:
             if self.wanted(alert):
-                self.queue.put(alert)
+                self.queue.put(self.capture(alert))
         except Exception:  # noqa: BLE001 - a bad predicate must not stop the pump
             pass
 
@@ -423,16 +434,21 @@ class Sidecar:
                     subscriber.offer(alert)
 
     @contextlib.contextmanager
-    def _subscribe(self, wanted):
+    def _subscribe(self, wanted, capture):
         """
-        Receives alerts matching `wanted` for the length of the block.
+        Receives snapshots of alerts matching `wanted` for the length of the
+        block.
 
         Registered before the thing that provokes the alert is asked for, never
         after: the pump runs continuously, so an alert answered quickly can
         arrive before a subscription made afterwards would have existed to
         catch it.
+        @param wanted: Called on the pump thread; True to take this alert.
+        @param capture: Called on the pump thread; returns what to queue. It
+            must copy everything it needs out of the alert, which is invalid
+            the moment the pump pops again. See _Subscription.
         """
-        subscription = _Subscription(wanted)
+        subscription = _Subscription(wanted, capture)
         with self._subscriber_lock:
             self._subscribers.append(subscription)
         try:
@@ -508,15 +524,16 @@ class Sidecar:
         @return: The counters, or an empty mapping.
         """
         wanted = lambda alert: isinstance(alert, lt.session_stats_alert)  # noqa: E731
-        with self._subscribe(wanted) as subscription:
+        # Copied on the pump's thread. A dict keyed by metric name in these
+        # bindings, despite find_metric_idx existing beside it and suggesting
+        # indices.
+        capture = lambda alert: dict(alert.values)  # noqa: E731
+        with self._subscribe(wanted, capture) as subscription:
             self._session.post_session_stats()
             try:
-                alert = subscription.queue.get(timeout=5)
+                return subscription.queue.get(timeout=5)
             except queue.Empty:
                 return {}
-        # A dict keyed by metric name in these bindings, despite find_metric_idx
-        # existing beside it and suggesting indices.
-        return dict(alert.values)
 
     def op_add(self, params):
         """Add a torrent from raw .torrent bytes or a magnet URI."""
@@ -1133,7 +1150,21 @@ class Sidecar:
                 return alert.piece == index and alert.handle == handle
             return _problem(alert) is not None
 
-        with self._subscribe(wanted) as subscription:
+        def capture(alert):
+            """Everything this read needs, copied while the alert is alive."""
+            if isinstance(alert, lt.read_piece_alert):
+                failed = alert.error.value() != 0
+                return {
+                    "piece": alert.piece,
+                    "refusal": alert.error.message() if failed else None,
+                    # bytes() rather than the buffer itself: the binding hands
+                    # back a view of memory the session owns, and the point of
+                    # this whole exercise is not to keep one of those.
+                    "data": None if failed else bytes(alert.buffer),
+                }
+            return {"note": _problem(alert)}
+
+        with self._subscribe(wanted, capture) as subscription:
             handle.piece_priority(index, 7)
             handle.set_piece_deadline(
                 index, deadline, lt.deadline_flags_t.alert_when_available
@@ -1156,11 +1187,11 @@ class Sidecar:
                 except queue.Empty:
                     item = None
 
-                if isinstance(item, lt.read_piece_alert):
-                    if item.error.value() == 0:
+                if item is not None and "piece" in item:
+                    if item["refusal"] is None:
                         return {
                             "piece": index,
-                            "data": base64.b64encode(item.buffer).decode(),
+                            "data": base64.b64encode(item["data"]).decode(),
                         }
                     # Not a failure. "I do not have that piece yet."
                     #
@@ -1176,11 +1207,11 @@ class Sidecar:
                     #
                     # The caller's timeout is the budget for waiting, and it is
                     # already running. Keep it.
-                    refused = item.error.message()
+                    refused = item["refusal"]
                 elif item is not None:
                     # Kept for this read's own report. The pump has already said
                     # it out loud, once, on behalf of everybody.
-                    note = _problem(item)
+                    note = item.get("note")
                     if note is not None and note not in problems:
                         problems.append(note)
 

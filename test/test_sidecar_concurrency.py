@@ -272,5 +272,68 @@ class ReadsDoNotStarveOrStealFromEachOther(unittest.TestCase):
         )
 
 
+
+class AlertsAreNeverHeldPastThePump(unittest.TestCase):
+    """
+    libtorrent owns its alerts and frees them on the next pop_alerts(), so an
+    alert object handed to another thread is a pointer into memory the session
+    is about to reuse. Reading one later is a use-after-free, and it does not
+    raise -- it takes the process out with SIGSEGV.
+
+    Confirmed against the installed bindings: capture alerts, pop five more
+    times, then read one of the captured ones, and the interpreter dies with a
+    memory-corruption code rather than an exception.
+
+    Asserted as a type invariant rather than by reproducing it, because a test
+    that segfaults takes the runner with it and reports nothing. Nothing a
+    subscriber can receive may be an alert.
+    """
+
+    def test_a_subscription_queues_snapshots_not_alerts(self):
+        import libtorrent as lt
+
+        sidecar_module = _sidecar_module()
+        sidecar = sidecar_module.Sidecar.__new__(sidecar_module.Sidecar)
+        sidecar._subscriber_lock = threading.Lock()
+        sidecar._subscribers = []
+        sidecar._reported = set()
+
+        seen = []
+        with sidecar_module.Sidecar._subscribe(
+            sidecar,
+            lambda alert: True,
+            lambda alert: {"kind": type(alert).__name__},
+        ) as subscription:
+            # Stand in for the pump, which is what calls offer().
+            session = lt.session({"listen_interfaces": "0.0.0.0:0"})
+            session.post_session_stats()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not seen:
+                for alert in session.pop_alerts():
+                    subscription.offer(alert)
+                    seen.append(alert)
+                time.sleep(0.02)
+
+        self.assertTrue(seen, "no alerts were produced to offer")
+        queued = []
+        while not subscription.queue.empty():
+            queued.append(subscription.queue.get_nowait())
+        self.assertTrue(queued, "nothing reached the queue")
+        for item in queued:
+            self.assertNotIsInstance(
+                item,
+                lt.alert,
+                "an alert object reached a queue; it will be freed under the reader",
+            )
+            self.assertIsInstance(item, dict)
+
+
+def _sidecar_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("libtorrent_sidecar", SIDECAR)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 if __name__ == "__main__":
     unittest.main()
