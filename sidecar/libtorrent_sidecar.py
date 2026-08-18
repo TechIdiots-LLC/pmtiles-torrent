@@ -166,6 +166,10 @@ UNREADY_STATES = frozenset(
 CHECKING_FILES = getattr(lt.torrent_status, "checking_files", None)
 
 
+# How often a one-shot hash says where it has got to. See create_once.
+PROGRESS_INTERVAL = 0.5
+
+
 PEER_FLAGS = (
     "interesting",
     "choked",
@@ -1277,67 +1281,15 @@ class Sidecar:
 
     def op_create(self, params):
         """
-        Create a torrent from a local file.
+        Create a torrent from a local file, in this process.
 
-        Defaults to a hybrid v1+v2 torrent: v2 brings per-file merkle trees
-        with 16 KiB leaf blocks, so a peer can verify a small block without the
-        whole hash list, while the v1 half keeps every existing client working.
-        This is the main thing create-torrent cannot do.
+        Kept for callers that have nowhere better to do it. The hash cannot be
+        cancelled here -- libtorrent's hashing does not check for interruption,
+        and this process holds the session and every torrent in it, so it
+        cannot be ended to stop one. `--create` exists for that; see
+        build_torrent.
         """
-        path = params["path"]
-        piece_length = int(params.get("pieceLength", 4 * 1024 * 1024))
-
-        storage = lt.file_storage()
-        lt.add_files(storage, path)
-
-        flags = 0
-        fmt = params.get("format", "hybrid")
-        if fmt == "v1":
-            flags |= lt.create_torrent.v1_only
-        elif fmt == "v2":
-            flags |= lt.create_torrent.v2_only
-
-        creator = lt.create_torrent(storage, piece_length, flags=flags)
-
-        # Trackers arrive as BEP 12 tiers: a list of lists, tried in order,
-        # everything within a tier tried together. Flattening them would turn a
-        # deliberate fallback order into a stampede.
-        for tier, group in enumerate(params.get("trackers", [])):
-            for tracker in group if isinstance(group, list) else [group]:
-                creator.add_tracker(tracker, tier)
-        for seed in params.get("webSeeds", []):
-            creator.add_url_seed(seed)
-        if params.get("comment"):
-            creator.set_comment(params["comment"])
-        if params.get("private"):
-            creator.set_priv(True)
-        creator.set_creator(params.get("createdBy") or "pmtiles-swarm")
-
-        # The callback is not for progress -- it is what makes this yield.
-        #
-        # Without one, libtorrent's binding holds the GIL for the whole of
-        # set_piece_hashes, so no other Python thread runs until the last piece
-        # is done. Measured on 2.0.13 against a 400 MiB file: one tick of a
-        # 5ms ticker thread with no callback, thirty-two with one, and a
-        # longest stall of 580ms against 64ms. Passing a callback makes the
-        # binding release and reacquire the GIL per piece, which is what lets
-        # the reader loop keep answering `list` and `get` while an archive
-        # hashes. For a 698 GiB archive that is the difference between a
-        # console that works and one that times out for hours.
-        lt.set_piece_hashes(creator, os.path.dirname(path) or ".", lambda _index: None)
-        entry = creator.generate()
-        raw = lt.bencode(entry)
-        info = lt.torrent_info(entry)
-
-        return {
-            "torrentFile": base64.b64encode(raw).decode(),
-            "infoHash": _v1_of(info),
-            "name": info.name(),
-            "size": info.total_size(),
-            "pieceLength": info.piece_length(),
-            "pieceCount": info.num_pieces(),
-            "format": fmt,
-        }
+        return build_torrent(params)
 
     def op_metadata(self, params):
         """
@@ -1844,6 +1796,145 @@ class Sidecar:
 THREADED_OPS = frozenset({"create", "read_piece", "reachability"})
 
 
+def build_torrent(params, on_piece=None):
+    """
+    Create a torrent from a local file.
+
+    Defaults to a hybrid v1+v2 torrent: v2 brings per-file merkle trees with
+    16 KiB leaf blocks, so a peer can verify a small block without the whole
+    hash list, while the v1 half keeps every existing client working. This is
+    the main thing create-torrent cannot do.
+    @param params: path, pieceLength, format, trackers, webSeeds, comment,
+        private, createdBy.
+    @param on_piece: Called as (index, total) as hashing proceeds.
+    @return: The torrent, base64 encoded, with what the caller needs about it.
+    """
+    path = params["path"]
+    piece_length = int(params.get("pieceLength", 4 * 1024 * 1024))
+
+    storage = lt.file_storage()
+    lt.add_files(storage, path)
+
+    flags = 0
+    fmt = params.get("format", "hybrid")
+    if fmt == "v1":
+        flags |= lt.create_torrent.v1_only
+    elif fmt == "v2":
+        flags |= lt.create_torrent.v2_only
+
+    creator = lt.create_torrent(storage, piece_length, flags=flags)
+
+    # Trackers arrive as BEP 12 tiers: a list of lists, tried in order,
+    # everything within a tier tried together. Flattening them would turn a
+    # deliberate fallback order into a stampede.
+    for tier, group in enumerate(params.get("trackers", [])):
+        for tracker in group if isinstance(group, list) else [group]:
+            creator.add_tracker(tracker, tier)
+    for seed in params.get("webSeeds", []):
+        creator.add_url_seed(seed)
+    if params.get("comment"):
+        creator.set_comment(params["comment"])
+    if params.get("private"):
+        creator.set_priv(True)
+    creator.set_creator(params.get("createdBy") or "pmtiles-swarm")
+
+    # The callback is not only for progress -- it is what makes this yield.
+    #
+    # Without one, libtorrent's binding holds the GIL for the whole of
+    # set_piece_hashes, so no other Python thread runs until the last piece is
+    # done. Measured on 2.0.13 against a 400 MiB file: one tick of a 5ms ticker
+    # thread with no callback, thirty-two with one, and a longest stall of
+    # 580ms against 64ms. Passing a callback makes the binding release and
+    # reacquire the GIL per piece, which is what lets anything else in this
+    # process keep running while an archive hashes. So one is passed even when
+    # nobody wants to be told anything.
+    total = creator.num_pieces()
+    if on_piece is None:
+        tick = lambda _index: None  # noqa: E731 - a callback, not a function
+    else:
+
+        def tick(index):
+            on_piece(index, total)
+
+    lt.set_piece_hashes(creator, os.path.dirname(path) or ".", tick)
+    entry = creator.generate()
+    raw = lt.bencode(entry)
+    info = lt.torrent_info(entry)
+
+    return {
+        "torrentFile": base64.b64encode(raw).decode(),
+        "infoHash": _v1_of(info),
+        "name": info.name(),
+        "size": info.total_size(),
+        "pieceLength": info.piece_length(),
+        "pieceCount": info.num_pieces(),
+        "format": fmt,
+    }
+
+
+def create_once(stdin=None, stdout=None):
+    """
+    Hash one archive and exit, in a process of its own.
+
+    Cancellation is the point. libtorrent's hashing never checks for
+    interruption, so the only way to stop a hash somebody started by mistake is
+    to end the process running it -- and the sidecar cannot be ended, because
+    it holds the session and every torrent seeding from it. Here there is
+    nothing to lose: the parent kills this process, the hash stops, and the
+    archive it was reading is untouched. On a 698 GiB build that is the
+    difference between a mistake costing a keystroke and costing six hours.
+
+    Isolation comes with it. Hashing at that size saturates a disk, and doing
+    it in the sidecar meant the session competed with it for both the disk and
+    the GIL. That is also why progress is worth having: an archive of this size
+    hashes for hours, and "hashing 698 GiB · 3m" says nothing about whether it
+    is a third of the way through or stuck.
+
+    Speaks the same line-delimited JSON as the pipe protocol:
+
+        <- {"event": "progress", "piece": 4096, "pieces": 178234}
+        <- {"ok": true, "result": {...}}
+        <- {"ok": false, "error": "..."}
+
+    @param stdin: Where the request is read from. Defaults to sys.stdin.
+    @param stdout: Where events are written. Defaults to sys.stdout.
+    @return: A process exit status.
+    """
+    stdin = stdin or sys.stdin
+    stdout = stdout or sys.stdout
+
+    def emit(message):
+        stdout.write(json.dumps(message) + "\n")
+        stdout.flush()
+
+    try:
+        params = json.loads(stdin.read() or "{}")
+    except json.JSONDecodeError as error:
+        emit({"ok": False, "error": f"bad request: {error}"})
+        return 2
+
+    # Throttled by time rather than by a piece count, because a piece is
+    # 4 MiB of a fast local disk or of a slow network share and the two are
+    # orders of magnitude apart. 178,000 pieces would otherwise be 178,000
+    # lines for the parent to parse.
+    last = 0.0
+
+    def report(index, total):
+        nonlocal last
+        now = time.monotonic()
+        if now - last < PROGRESS_INTERVAL and index + 1 < total:
+            return
+        last = now
+        emit({"event": "progress", "piece": index, "pieces": total})
+
+    try:
+        emit({"ok": True, "result": build_torrent(params, report)})
+    except Exception as error:  # noqa: BLE001 - report everything to the parent
+        emit({"ok": False, "error": str(error)})
+        return 1
+    return 0
+
+
 def main():
     """Read requests from stdin, write responses to stdout, one JSON per line."""
     settings = json.loads(os.environ.get("SIDECAR_SETTINGS", "{}"))
@@ -1900,6 +1991,12 @@ def main():
 
         if op == "shutdown":
             break
+
+
+if __name__ == "__main__" and "--create" in sys.argv[1:]:
+    # One archive, hashed and reported, with no session and no port. Started
+    # per hash and ended when the hash is no longer wanted. See create_once.
+    sys.exit(create_once())
 
 
 if __name__ == "__main__":

@@ -7,6 +7,29 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.8.0
+### ✨ Features and improvements
+- **`--create` hashes one archive in a process of its own, so a hash can be cancelled and can say
+  how far it has got.** libtorrent's hashing never checks for interruption, so the only way to stop
+  one is to end the process running it — and the sidecar cannot be ended, because it holds the
+  session and every torrent seeding from it. A 698 GiB build started by a misclick therefore ran
+  its full six hours, saturating the disk the rest of the library was being served from.
+
+  The one-shot holds no session and opens no port, so killing it costs the hash and nothing else;
+  hashing only ever reads, so the archive is untouched. It speaks the same line-delimited JSON as
+  the pipe protocol, reading its parameters from stdin:
+
+      <- {"event": "progress", "piece": 4096, "pieces": 178234}
+      <- {"ok": true, "result": {...}}
+
+  Progress is throttled by time rather than piece count — 178,000 pieces would otherwise be
+  178,000 lines — and the last piece always reports, so a caller drawing a bar reaches 100%. The
+  callback carrying it is the one that already had to exist to release the GIL.
+
+  `create` over the pipe is unchanged and still works. Both now share one `build_torrent`.
+
+### 🐞 Bug fixes
+
 ## 0.7.5
 ### ✨ Features and improvements
 
