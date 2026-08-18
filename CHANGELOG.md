@@ -7,6 +7,26 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.9.0
+### ✨ Features and improvements
+- **`pause` and `resume`, which did not exist.** A consumer had no way to stop a torrent short of
+  removing it, and removing it drops the resume data — so resuming a 698 GiB archive meant hashing
+  the whole store again to arrive back where it started. Reported from the field as a pause that
+  did nothing: the row read `paused` while the archive went on downloading at 8.4 MiB/s.
+
+### 🐞 Bug fixes
+- **A paused torrent no longer starts itself again a second later.** `handle.pause()` on its own is
+  not a stop. libtorrent's auto-manager owns the paused flag of every torrent carrying
+  `auto_managed`, and clears it again within about a second — measured against 2.0.13: paused at
+  0.2s, running at 1.0s, still running at six. Since the flag is what a status reports, that is an
+  archive describing itself as paused while it transfers. `auto_managed` is now taken away when a
+  torrent is stopped and given back when it starts, except in cache mode, which is kept out of the
+  auto-manager on purpose — it wants no bytes, so the manager reads it as idle and pauses it, and a
+  paused torrent stops seeding.
+- **Adding an archive paused now keeps it paused.** The same defect on the path a restart takes:
+  the `paused` flag was set on the add and the auto-manager cleared it, so every archive that had
+  been paused came back up transferring.
+
 ## 0.8.0
 ### ✨ Features and improvements
 - **`--create` hashes one archive in a process of its own, so a hash can be cancelled and can say

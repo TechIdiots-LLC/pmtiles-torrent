@@ -297,9 +297,16 @@ class Recheck(unittest.TestCase):
     """
 
     class FakeHandle:
+        class Status:
+            """Enough of a torrent_status to say this is not cache mode."""
+
+            has_metadata = True
+            total_wanted = 1024
+
         def __init__(self, paused=False, raises=None):
             self.rechecked = False
             self.resumed = False
+            self.managed = False
             self._paused = paused
             self._raises = raises
 
@@ -311,8 +318,15 @@ class Recheck(unittest.TestCase):
         def flags(self):
             return lt.torrent_flags.paused if self._paused else 0
 
+        def status(self):
+            return self.Status()
+
         def resume(self):
             self.resumed = True
+
+        def set_flags(self, flags):
+            if flags & lt.torrent_flags.auto_managed:
+                self.managed = True
 
     def instance(self, handle):
         obj = sidecar.Sidecar.__new__(sidecar.Sidecar)
@@ -336,6 +350,9 @@ class Recheck(unittest.TestCase):
         )
         self.assertTrue(handle.resumed)
         self.assertTrue(got["wasPaused"])
+        # And back under the auto-manager. Pausing takes it away, so resuming
+        # without restoring it leaves the torrent running outside the queue.
+        self.assertTrue(handle.managed)
 
     def test_leaves_a_running_torrent_alone(self):
         handle = self.FakeHandle(paused=False)

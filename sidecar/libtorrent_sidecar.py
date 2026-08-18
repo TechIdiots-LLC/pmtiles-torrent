@@ -262,6 +262,51 @@ def _identify(atp):
     return _v1_of(atp)
 
 
+def _wants_nothing(status):
+    """
+    Whether a torrent is in cache mode: joined, but asking for no bytes.
+
+    Every file is priority 0, so libtorrent has nothing it means to fetch. Such
+    a torrent is deliberately kept out of the auto-manager's hands, and putting
+    it back is not a neutral act -- see _release.
+    """
+    return bool(getattr(status, "has_metadata", False)) and status.total_wanted == 0
+
+
+def _hold(handle):
+    """
+    Stop a torrent in a way that the auto-manager will not quietly undo.
+
+    handle.pause() on its own is not a stop. libtorrent's auto-manager owns the
+    paused flag of every torrent carrying auto_managed, and it clears it again
+    within about a second: measured against 2.0.13, paused at 0.2s, running
+    again at 1.0s and still running at six. The flag is what a status reports,
+    so pausing that way produces an archive that says "paused" while it goes on
+    transferring -- reported from the field as a pause that did nothing, with
+    the row reading `paused` beside 8.4 MiB/s of download.
+
+    Taking auto_managed away first is what makes the pause the caller's
+    decision rather than a suggestion. _release gives it back.
+    """
+    handle.unset_flags(lt.torrent_flags.auto_managed)
+    handle.pause()
+
+
+def _release(handle, managed=True):
+    """
+    Start a torrent again, and hand it back to the auto-manager.
+
+    Except a cache-mode torrent, which was taken out of the auto-manager's
+    hands on purpose when it was added. It wants no bytes, so the manager reads
+    it as idle and pauses it -- and a paused torrent stops seeding, which is
+    the one thing cache mode exists to do. Restoring the flag there would turn
+    "resume" into a slower pause.
+    """
+    handle.resume()
+    if managed:
+        handle.set_flags(lt.torrent_flags.auto_managed)
+
+
 def _fraction(values):
     """
     How much of a bucket is held, as 0-255.
@@ -823,6 +868,10 @@ class Sidecar:
 
         if params.get("paused"):
             atp.flags |= lt.torrent_flags.paused
+            # And out of the auto-manager's reach, or it starts it again within
+            # the second -- see _hold. This is the path a restart takes, so
+            # without it every paused archive came back up transferring.
+            atp.flags &= ~lt.torrent_flags.auto_managed
 
         # Resume data libtorrent refuses is the same problem one step later.
         # read_resume_data parses a file whose infohash belongs to a different
@@ -1040,9 +1089,42 @@ class Sidecar:
         # would report success for something that never ran.
         was_paused = bool(handle.flags() & lt.torrent_flags.paused)
         if was_paused:
-            handle.resume()
+            _release(handle, not _wants_nothing(handle.status()))
 
         return {"rechecking": True, "wasPaused": was_paused}
+
+    def op_pause(self, params):
+        """Stop a torrent, and have it stay stopped.
+
+        Not the same as removing it: the data stays, the torrent stays in the
+        session, and resuming costs nothing. Removing and re-adding would drop
+        the resume data, which for a 698 GiB archive means re-hashing the whole
+        store to arrive back where it started.
+
+        There was no pause here at all before this. The caller's pause reached
+        the catalog and stopped, so an archive read `paused` in the console
+        while it went on transferring at 8 MiB/s.
+        """
+        handle = self._handle(params["infoHash"])
+        _hold(handle)
+        # The pump reports only torrents that have changed, and a flag is a
+        # change -- but asking costs nothing and means the next listing is
+        # right rather than probably right.
+        handle.post_status()
+        return {"paused": True}
+
+    def op_resume(self, params):
+        """Offer a stopped torrent again.
+
+        One round-trip for the status, which a listing could not afford but
+        this can: resuming is somebody pressing a button, not a poll. What it
+        buys is knowing whether this is a cache-mode torrent, which must not be
+        handed back to the auto-manager -- see _release.
+        """
+        handle = self._handle(params["infoHash"])
+        _release(handle, not _wants_nothing(handle.status()))
+        handle.post_status()
+        return {"paused": False}
 
     def op_list(self, _params):
         """Report the state of every torrent in the session.
