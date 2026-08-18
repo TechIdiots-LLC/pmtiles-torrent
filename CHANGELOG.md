@@ -7,27 +7,50 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.7.4
+### ✨ Features and improvements
+
+### 🐞 Bug fixes
+- **Saving resume data was corrupting it, and archives disappeared from the session a few more
+  with every restart.** Reported from the field as `[restore] <archive>: mismatching info-hash`,
+  starting with one archive and reaching eighteen over successive restarts. An archive that failed
+  this way was never added at all: it showed 0% and no state in the console, a recheck answered
+  `no such torrent`, and its data sat complete on the disk the whole time — a preview rendered
+  from it perfectly well.
+
+  `op_save_resume` was the last consumer still popping the session's alert queue itself, on its own
+  thread, while the pump popped on another. Two threads on one destructive queue is not a race that
+  can be narrowed: the pump's next `pop_alerts()` frees the batch the other is still reading, so
+  `alert.handle` and `alert.params` became reads of memory the session had reclaimed. What reached
+  the disk was resume data under another torrent's name.
+
+  libtorrent parses such a file without complaint — it is `add_torrent` that rejects it, because
+  real resume data carries its own infohash. Confirmed against 2.0.13: save a torrent's resume
+  data, file it under a different torrent's name, and the add fails with exactly
+  `mismatching info-hash [libtorrent:30]`.
+
+  This is the same fault 0.7.1 fixed for piece reads, in the one place that was missed. Resume data
+  is now collected through the pump like everything else, with the infohash and the serialised
+  buffer both taken on the pump's thread while the alert is valid. 0.7.2 did not introduce this,
+  but it made the pump pop far more often, which widened the window enough to make it routine.
+
+- **A resume file the torrent cannot use now costs a recheck rather than the archive.** Whatever
+  the reason — a file spoiled before this release, a truncated write, anything — the add is retried
+  without it, the recheck finds every byte that is on disk, and nothing is downloaded again. The
+  unusable file is discarded rather than left to fail the same add on every future start.
+
+- **Resume data is written atomically.** Staged beside the target and renamed over it, with an
+  fsync so the rename cannot reach the disk before the bytes. An interrupted write leaves the
+  previous good copy instead of a truncated file under the real name.
+
 ## 0.7.3
 ### ✨ Features and improvements
 
 ### 🐞 Bug fixes
-- **A reboot could take archives out of the session entirely, and they stayed out.** Reported from
-  the field: after a restart the five largest archives showed 0% and no state, a recheck answered
-  `no such torrent`, and their data was sitting on the disk in full the whole time — a preview
-  rendered from it perfectly well.
-
-  Resume data was written by opening the real path and writing into it, so a machine going down
-  mid-write left a truncated file under the real name. `read_resume_data` then raised straight out
-  of `add`, which failed the whole add, so restoring the library skipped that archive: never in the
-  session, absent from every listing, and nothing to recheck. Resume data is a piece bitfield, so
-  the largest and most complete archives have the biggest files and the widest window — which is
-  why it took the big ones and left the small, busy ones alone.
-
-  Both halves are fixed. Resume data is now written beside the target and renamed over it, with an
-  fsync so the rename cannot reach the disk before the bytes — `os.replace` is atomic on both
-  platforms, so an interrupted write leaves the previous good copy. And a resume file that cannot
-  be parsed now costs a recheck rather than the archive: the add proceeds without it, finds every
-  byte that is on disk, and downloads nothing again.
+- **A resume file that cannot be parsed costs a recheck, not the archive.** It used to raise
+  straight out of `add`, so restoring the library skipped that archive entirely: never in the
+  session, absent from every listing, and nothing to recheck. (The archives disappearing in the
+  field were doing so for a different reason — see 0.7.4 — but the brittleness was real.)
 
 - **A torrent removed and immediately added back could vanish from listings for good.**
   `torrent_removed_alert` arrives well after the removal that caused it, and 0.7.2 dropped the

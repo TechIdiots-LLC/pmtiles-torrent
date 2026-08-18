@@ -19,10 +19,12 @@ and returns, and the session answers with one alert describing everything -- so
 the pump keeps every torrent's state current and a listing reads a dictionary.
 """
 
+import base64
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -212,6 +214,99 @@ class ListingIsAnsweredFromCache(unittest.TestCase):
         )
         self.assertIsNotNone(instance._handle(info_hash))
 
+    def test_resume_data_for_another_torrent_costs_a_recheck(self):
+        # What actually took the node's library out. Resume data was written by
+        # a loop that popped the session's alert queue while the pump popped it
+        # too, so the pump's next pop freed the batch that loop was reading:
+        # alert.handle and alert.params became reads of reclaimed memory, and
+        # what reached the disk was resume data under another torrent's name.
+        #
+        # read_resume_data parses such a file perfectly well. add_torrent is
+        # what rejects it -- "mismatching info-hash" -- which failed the add,
+        # so the archive was never in the session: 0% and no state in the
+        # console, "no such torrent" from a recheck, data untouched on disk.
+        # Eighteen archives on the reporting node, a few more each restart.
+        work = tempfile.mkdtemp(prefix="resume-wrong-")
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        instance = sidecar.Sidecar({
+            "listen": "127.0.0.1:0",
+            "dht": False,
+            "lsd": False,
+            "upnp": False,
+            "natpmp": False,
+            "resumeDir": work,
+        })
+        self.addCleanup(self._shutdown, instance)
+
+        mine = instance.op_create(
+            {"path": self.data, "pieceLength": 1024 * 1024, "format": "v1"}
+        )
+        # A second, genuinely different torrent, whose resume data is filed
+        # under the first one's name. That is exactly what the race produced.
+        other = os.path.join(work, "other.bin")
+        with open(other, "wb") as handle:
+            handle.write(os.urandom(1024 * 1024))
+        theirs = instance.op_create(
+            {"path": other, "pieceLength": 1024 * 1024, "format": "v1"}
+        )
+
+        # Genuine resume data, saved the way the timer saves it -- it carries
+        # its own infohash, which is what libtorrent then refuses. A blob built
+        # by hand does not: its identity is zero and the add is accepted.
+        instance.op_add({
+            "torrentFile": theirs["torrentFile"],
+            "savePath": work,
+            "seedOnly": True,
+        })
+        instance.op_save_resume({})
+        instance.op_remove({"infoHash": theirs["infoHash"]})
+        shutil.copyfile(
+            os.path.join(work, f"{theirs['infoHash']}.resume"),
+            os.path.join(work, f"{mine['infoHash']}.resume"),
+        )
+
+        added = instance.op_add({
+            "torrentFile": mine["torrentFile"],
+            "savePath": self.work,
+            "seedOnly": True,
+        })
+
+        self.assertEqual(added["infoHash"], mine["infoHash"])
+        self.assertIn(
+            mine["infoHash"],
+            [entry["infoHash"] for entry in instance.op_list({})],
+            "the archive was skipped instead of rechecked",
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(work, f"{mine['infoHash']}.resume")),
+            "the unusable resume file was kept, to fail the add again next start",
+        )
+
+    def test_saving_resume_data_never_pops_the_alert_queue(self):
+        # The root cause, stated directly. Two threads popping one destructive
+        # queue is not a race that can be narrowed -- the pump's pop frees what
+        # the other is reading. Everything else already goes through the pump.
+        instance = self.sidecar_instance()
+        self.seed(instance)
+
+        popped = []
+        real_pop = instance._session.pop_alerts
+        caller = threading.current_thread()
+
+        def watched():
+            if threading.current_thread() is caller:
+                popped.append(True)
+            return real_pop()
+
+        instance._session.pop_alerts = watched
+        try:
+            saved = instance.op_save_resume({})
+        finally:
+            instance._session.pop_alerts = real_pop
+
+        self.assertEqual(popped, [], "op_save_resume popped the session's alerts")
+        self.assertEqual(saved["written"], 1, "no resume data was written")
+
     def test_resume_data_is_never_left_half_written(self):
         # The other half: no truncated file should exist to be read. Written
         # beside the target and renamed over it, so an interrupted write leaves
@@ -233,15 +328,11 @@ class ListingIsAnsweredFromCache(unittest.TestCase):
             opened.append(str(path))
             return real_open(path, *args, **kwargs)
 
-        params = sidecar.lt.add_torrent_params()
-        params.info_hashes = sidecar.lt.info_hash_t(
-            sidecar.lt.sha1_hash(bytes.fromhex(info_hash))
-        )
         import builtins
 
         builtins.open = watched
         try:
-            instance._write_resume(info_hash, params)
+            instance._write_resume(info_hash, b"the new copy")
         finally:
             builtins.open = real_open
 

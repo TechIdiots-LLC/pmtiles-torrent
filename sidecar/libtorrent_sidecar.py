@@ -743,21 +743,22 @@ class Sidecar:
         # Found by the torrent's own infohash rather than one the caller had to
         # remember to send. It did rely on the caller, nothing sent it, so the
         # lookup was always for None and every restart re-checked everything.
-        resume = self._read_resume(params.get("infoHash") or _identify(atp))
+        wanted_hash = params.get("infoHash") or _identify(atp)
+        used_resume = False
+        resume = None if params.get("ignoreResume") else self._read_resume(wanted_hash)
         if resume:
-            # A resume file that cannot be parsed costs a recheck, not the
+            # A resume file this torrent cannot use costs a recheck, not the
             # archive. It used to raise straight out of the add, so restoring
             # the library skipped that archive entirely: not in the session,
             # absent from every listing, "no such torrent" from a recheck, and
             # its data sitting on the disk in full the whole time. Rechecking
             # a 657 GiB archive is slow, but it finds every byte that is there
-            # and nothing is downloaded again. See _write_resume, which is why
-            # a truncated one should no longer exist.
+            # and nothing is downloaded again.
             try:
                 restored = lt.read_resume_data(resume)
             except Exception as error:  # noqa: BLE001 - any malformed file
                 self._say_once(
-                    f"resume data for {_identify(atp)} is unreadable ({error}); "
+                    f"resume data for {wanted_hash} is unreadable ({error}); "
                     "adding it anyway and rechecking what is on disk"
                 )
             else:
@@ -768,6 +769,7 @@ class Sidecar:
                 if atp.ti is not None:
                     restored.ti = atp.ti
                 atp = restored
+                used_resume = True
 
         # Applied after the resume swap, not before: read_resume_data returns a
         # fresh params object, so anything set earlier was thrown away. Cache
@@ -809,7 +811,31 @@ class Sidecar:
         if params.get("paused"):
             atp.flags |= lt.torrent_flags.paused
 
-        handle = self._session.add_torrent(atp)
+        # Resume data libtorrent refuses is the same problem one step later.
+        # read_resume_data parses a file whose infohash belongs to a different
+        # torrent perfectly well, and add_torrent is what rejects it, with
+        # "mismatching info-hash". That failed the add, and the archive was
+        # never in the session -- so it showed 0% and no state, a recheck
+        # answered "no such torrent", and its data lay on disk untouched.
+        # Seen in the field across eighteen archives, spreading a few at a time
+        # with every restart. The cause was in op_save_resume and is fixed, but
+        # a file already written cannot be un-written, and neither can one
+        # spoiled by anything else. Discard it and add without it: the recheck
+        # finds what is on disk, and nothing is fetched again.
+        try:
+            handle = self._session.add_torrent(atp)
+        except Exception as error:  # noqa: BLE001 - libtorrent's own refusal
+            if not used_resume:
+                raise
+            self._say_once(
+                f"resume data for {wanted_hash} was refused ({error}); "
+                "discarding it and rechecking what is on disk"
+            )
+            self._discard_resume(wanted_hash)
+            # Built again from the caller's own parameters rather than by
+            # unpicking this one, so the retry is the same add in every respect
+            # except that there is no resume data to apply.
+            return self.op_add({**params, "ignoreResume": True})
 
         # Fetch the head before anything asks for it.
         #
@@ -1555,35 +1581,77 @@ class Sidecar:
         }
 
     def op_save_resume(self, params):
-        """Persist resume data for one torrent, or all of them."""
+        """Persist resume data for one torrent, or all of them.
+
+        Through the pump, like every other alert consumer. This was the last
+        place that popped the session's alert queue itself, and it did so on a
+        thread of its own while the pump popped on another -- so each stole
+        alerts the other needed, and, far worse, the pump's next pop freed the
+        very batch this loop was still reading. `alert.handle` and
+        `alert.params` were then reads of memory the session had reclaimed.
+
+        What that wrote to disk: resume data under another torrent's name, or
+        another torrent's data under this one's. libtorrent refuses such a file
+        on the next start with "mismatching info-hash", which fails the add, so
+        the archive never entered the session at all -- 0% and no state in the
+        console, "no such torrent" from a recheck, and the data untouched on
+        disk the whole time. Every save cycle spoiled a few more, which is why
+        it spread across restarts: one archive, then two, then five.
+
+        Both values are taken on the pump's thread now, while the alert is
+        still valid, and the resume data is converted to bytes there rather
+        than carried out as a params object. See _Subscription.
+        """
         handles = (
             [self._handle(params["infoHash"])]
             if params.get("infoHash")
             else self._session.get_torrents()
         )
-        saved = 0
-        for handle in handles:
-            # Asked unconditionally.
-            #
-            # This used to ask need_save_resume_data() first, which reports
-            # whether anything has changed since the last save — not whether a
-            # resume file exists. A torrent that has sat there seeding since it
-            # was added answers "nothing has changed", so nothing was ever
-            # written for it, and it re-hashed its whole store on every start.
-            # The saving is a few kilobytes; the checking is half an hour.
-            handle.save_resume_data()
-            saved += 1
-        # Alerts carry the actual data; drain briefly to collect them.
-        deadline = time.time() + 5
-        while saved > 0 and time.time() < deadline:
-            self._session.wait_for_alert(500)
-            for alert in self._session.pop_alerts():
-                if isinstance(alert, lt.save_resume_data_alert):
-                    self._write_resume(_v1_of(alert.handle), alert.params)
-                    saved -= 1
-                elif isinstance(alert, lt.save_resume_data_failed_alert):
-                    saved -= 1
-        return {"saved": True}
+
+        def wanted(alert):
+            return isinstance(
+                alert, (lt.save_resume_data_alert, lt.save_resume_data_failed_alert)
+            )
+
+        def capture(alert):
+            if isinstance(alert, lt.save_resume_data_failed_alert):
+                return None
+            return (_v1_of(alert.handle), bytes(lt.write_resume_data_buf(alert.params)))
+
+        # Subscribed before anything is asked for, so an alert answered quickly
+        # cannot arrive before there is somewhere to put it.
+        with self._subscribe(wanted, capture) as subscription:
+            saved = 0
+            for handle in handles:
+                # Asked unconditionally.
+                #
+                # This used to ask need_save_resume_data() first, which reports
+                # whether anything has changed since the last save — not whether
+                # a resume file exists. A torrent that has sat there seeding
+                # since it was added answers "nothing has changed", so nothing
+                # was ever written for it, and it re-hashed its whole store on
+                # every start. The saving is a few kilobytes; the checking is
+                # half an hour.
+                handle.save_resume_data()
+                saved += 1
+
+            written = 0
+            deadline = time.time() + 5
+            while saved > 0 and time.time() < deadline:
+                try:
+                    item = subscription.queue.get(timeout=deadline - time.time())
+                except queue.Empty:
+                    break
+                saved -= 1
+                if item is None:
+                    continue
+                info_hash, buffer = item
+                if not info_hash:
+                    continue
+                self._write_resume(info_hash, buffer)
+                written += 1
+
+        return {"saved": True, "written": written}
 
     def op_shutdown(self, _params):
         """Persist resume data and stop."""
@@ -1697,30 +1765,41 @@ class Sidecar:
         with open(path, "rb") as handle:
             return handle.read()
 
-    def _write_resume(self, info_hash, params):
+    def _discard_resume(self, info_hash):
+        """Throws away a resume file the torrent it names cannot use.
+
+        Keeping it would fail the add again on every restart, forever, while
+        the archive it describes sits complete on the disk.
+        """
+        path = self._resume_path(info_hash)
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _write_resume(self, info_hash, buffer):
         """Persists resume data, completely or not at all.
 
-        Written beside the target and renamed over it, because the old way --
-        opening the real path and writing into it -- leaves a truncated file
-        under the real name if the machine goes down mid-write. Resume data is
-        a piece bitfield, so the largest and most complete archives have the
-        largest files and the widest window, and this timer fires every few
-        minutes for every torrent at once.
+        Written beside the target and renamed over it, because opening the real
+        path and writing into it leaves a truncated file under the real name if
+        the machine goes down mid-write. Resume data is a piece bitfield, so
+        the largest and most complete archives have the largest files and the
+        widest window, and this runs for every torrent at once on a timer.
 
-        What that cost: a truncated file makes read_resume_data raise, which
-        failed the whole add, so the archive was never put into the session at
-        all. It vanished from the console showing 0% and no state, a recheck
-        answered "no such torrent", and the data sat on disk untouched the
-        whole time. Seen in the field after a reboot, on the five largest
-        archives on the node. os.replace is atomic on both platforms, and the
-        fsync is what stops the rename reaching the disk before the bytes do.
+        os.replace is atomic on both platforms, so an interrupted write leaves
+        the previous good copy; the fsync is what stops the rename reaching the
+        disk before the bytes do.
+        @param info_hash: The torrent this describes.
+        @param buffer: Serialised resume data, taken on the pump's thread.
         """
         path = self._resume_path(info_hash)
         if not path:
             return
         staging = f"{path}.new"
         with open(staging, "wb") as handle:
-            handle.write(lt.write_resume_data_buf(params))
+            handle.write(buffer)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(staging, path)
