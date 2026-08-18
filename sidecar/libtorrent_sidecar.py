@@ -157,6 +157,15 @@ UNREADY_STATES = frozenset(
 # the C++ header but absent from the 2.x Python bindings, while `i2p_socket`
 # beside it is present. Naming them here means a missing one reads as "this
 # build cannot tell me", instead of raising and costing the whole peer list.
+# Actually hashing a store, which is the state that takes hours and the only
+# one that outranks the paused flag when a torrent is described.
+#
+# Deliberately not checking_resume_data: a torrent that is genuinely paused
+# rests in that state, so treating it as work in progress would report every
+# paused archive as busy -- the same confusion in the other direction.
+CHECKING_FILES = getattr(lt.torrent_status, "checking_files", None)
+
+
 PEER_FLAGS = (
     "interesting",
     "choked",
@@ -1709,7 +1718,17 @@ class Sidecar:
         cache_mode = has_metadata and s.total_wanted == 0
         info = getattr(s, "torrent_file", None) if has_metadata else None
 
-        if paused:
+        # Checking beats paused, because a torrent waiting its turn to be
+        # checked carries the paused flag and is not paused in any sense the
+        # reader means. libtorrent hashes one store at a time -- active_checking
+        # defaults to 1 -- and queues the rest with that flag set, so testing it
+        # first reported a library that was busy verifying itself as a library
+        # somebody had stopped. Seen in the field on the restart that recovered
+        # eighteen archives: all of them at work, nearly all of them "paused",
+        # and no way to tell that from an archive genuinely held back.
+        if CHECKING_FILES is not None and s.state == CHECKING_FILES:
+            state = "checking"
+        elif paused:
             state = "paused"
         elif cache_mode:
             state = "cache"

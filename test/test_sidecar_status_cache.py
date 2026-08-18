@@ -45,6 +45,24 @@ class RefusingSession:
         raise AssertionError(f"listing asked libtorrent for {name}()")
 
 
+class _Checking:
+    """A torrent_status carrying only what the state decision reads."""
+
+    def __init__(self, state, flags):
+        self.state = state
+        self.flags = flags
+        self.has_metadata = True
+        self.total_wanted = 1 << 30
+        self.progress = 0.5
+        self.name = "planet.pmtiles"
+        self.save_path = "/store"
+        self.info_hash = "c" * 40
+        self.torrent_file = None
+
+    def __getattr__(self, _name):
+        return 0
+
+
 class ListingIsAnsweredFromCache(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -348,6 +366,41 @@ class ListingIsAnsweredFromCache(unittest.TestCase):
             [],
             "the staging file was left behind",
         )
+
+    def test_an_archive_being_checked_says_so_rather_than_paused(self):
+        # libtorrent hashes one store at a time -- active_checking defaults to
+        # 1 -- and every torrent in that queue carries the paused flag,
+        # including the one actually being hashed. Testing that flag first made
+        # "checking" unreachable: on the restart that recovered eighteen
+        # archives the whole library read as paused, with no way to tell work
+        # in progress from an archive somebody had stopped.
+        work = tempfile.mkdtemp(prefix="checking-")
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        instance = self.sidecar_instance()
+
+        # Asserted on the rendering rather than by racing a real hash: which
+        # torrent libtorrent picks first, and whether it carries the flag at
+        # the instant of a poll, is timing. The invariant is not. A store being
+        # hashed is being hashed whether or not it is also queued.
+        rendered = instance._render(
+            _Checking(
+                state=sidecar.lt.torrent_status.checking_files,
+                flags=int(sidecar.lt.torrent_flags.paused)
+                | int(sidecar.lt.torrent_flags.auto_managed),
+            )
+        )
+        self.assertEqual(rendered["state"], "checking")
+
+        # And the other direction, which is what keeps this honest: a torrent
+        # genuinely held back rests in checking_resume_data, and calling that
+        # work in progress would be the same confusion reversed.
+        held = instance._render(
+            _Checking(
+                state=sidecar.lt.torrent_status.checking_resume_data,
+                flags=int(sidecar.lt.torrent_flags.paused),
+            )
+        )
+        self.assertEqual(held["state"], "paused")
 
     def test_paused_is_read_from_the_status_flags(self):
         # status() and flags() used to be two separate round-trips, and the

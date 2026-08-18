@@ -7,6 +7,20 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.7.5
+### ✨ Features and improvements
+
+### 🐞 Bug fixes
+- **An archive hashing its store said "paused".** libtorrent hashes one store at a time —
+  `active_checking` defaults to 1 — and every torrent in that queue carries the paused flag,
+  including the one being hashed. The paused flag was tested before the state, which made
+  "checking" all but unreachable: on the restart that recovered eighteen archives the whole library
+  read as paused, with no way to tell work in progress from an archive somebody had stopped.
+
+  Hashing now outranks the flag. Only `checking_files` does, though, not `checking_resume_data`: a
+  torrent genuinely held back rests in that second state, and calling it work in progress would be
+  the same confusion reversed.
+
 ## 0.7.4
 ### ✨ Features and improvements
 
