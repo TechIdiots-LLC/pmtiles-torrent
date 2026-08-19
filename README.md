@@ -319,6 +319,22 @@ however healthy that swarm is elsewhere. And a cold tile costs a whole piece —
 deliver 40 KB — so the swarm belongs in the background and never in front of a first paint. The
 case for it is bandwidth rather than latency: every piece a viewer pulls is one they seed back.
 
+
+**Bringing a large torrent up costs time before it costs bandwidth.** WebTorrent walks every piece
+before `ready` fires, so a fixed metadata budget quietly excludes the archives most worth sharing:
+a 749 GiB build is 178,690 pieces against 20,636 for an 80 GiB one, and the same 30-second budget
+joined the second and timed out on the first. Two things follow, and both are automatic:
+
+- **No verify pass without a store.** `path` unset means nothing is persisted, so there is nothing a
+  verify could find — but it is not free, and on a large archive it is the whole budget spent
+  proving an empty store is empty. `skipVerify` is set for you; a node that does keep a store
+  verifies as before, because there it has something worth checking.
+- **The budget grows with the torrent.** `readyTimeoutMs` gains a millisecond per piece where the
+  metainfo was supplied outright, which is the case that can be measured. A magnet carries no piece
+  count, so it gets the base budget.
+
+Neither refuses to join a large archive. A big archive is exactly the one where seeding is worth
+having, and a client that gives up on it because it is big would leave the whole point behind.
 ## Development
 
 TypeScript source in `src/`, compiled by tsup to ESM, CJS and declarations in `dist/`. Consumers

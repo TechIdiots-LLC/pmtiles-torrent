@@ -76,7 +76,10 @@ export interface WebTorrentEngineOptions {
    * engine picks the largest `.pmtiles` file, falling back to the largest file.
    */
   filePath?: string;
-  /** How long to wait for torrent metadata. Default 60s. */
+  /**
+   * How long to wait for torrent metadata. Default 60s, plus an allowance that
+   * scales with the piece count where the metainfo is supplied outright.
+   */
   readyTimeoutMs?: number;
   /**
    * Directory for resume data. WebTorrent otherwise re-hashes the entire store
@@ -281,6 +284,32 @@ async function loadWebTorrent(): Promise<WebTorrentConstructor> {
   }
 }
 
+
+/**
+ * How many v1 pieces a bencoded metainfo declares, without parsing it.
+ *
+ * Reads the length prefix of the `pieces` string, which is 20 bytes per piece.
+ * Enough to size a timeout, and cheaper than a bencode parser this package
+ * does not otherwise need. Returns 0 for a magnet, which carries no such thing.
+ */
+function pieceCountOf(torrentId: unknown): number {
+  if (!(torrentId instanceof Uint8Array)) return 0;
+  const marker = [54, 58, 112, 105, 101, 99, 101, 115]; // "6:pieces"
+  outer: for (let at = 0; at + marker.length < torrentId.length; at++) {
+    for (let n = 0; n < marker.length; n++) {
+      if (torrentId[at + n] !== marker[n]) continue outer;
+    }
+    let digits = "";
+    for (let n = at + marker.length; n < torrentId.length; n++) {
+      const code = torrentId[n];
+      if (code === 58) break; // ":"
+      if (code < 48 || code > 57) return 0;
+      digits += String.fromCharCode(code);
+    }
+    return digits ? Math.floor(Number(digits) / 20) : 0;
+  }
+  return 0;
+}
 /**
  * A {@link TorrentEngine} backed by WebTorrent.
  *
@@ -494,6 +523,13 @@ export class WebTorrentEngine implements TorrentEngine {
       deselect: true,
     };
     if (this.#options.path) addOptions.path = this.#options.path;
+    else {
+      // Nothing is persisted, so there is nothing a verify pass could find.
+      // It is not free either: WebTorrent walks every piece before `ready`
+      // fires, which on a 178,000-piece archive is what a browser spends its
+      // whole metadata budget on. See the README — "In a browser".
+      addOptions.skipVerify = true;
+    }
     if (this.#options.announce) addOptions.announce = this.#options.announce;
     // If the torrent carries a BEP 19 url-list, that HTTP origin is usually
     // faster and far more available than the swarm — measured serving a tile in
@@ -517,7 +553,12 @@ export class WebTorrentEngine implements TorrentEngine {
       if (resume) addOptions.bitfield = resume.bitfield;
     }
 
-    const timeoutMs = this.#options.readyTimeoutMs ?? 60000;
+    // A bigger torrent takes longer to bring up, and a fixed budget silently
+    // excludes the archives most worth sharing. One millisecond per piece on
+    // top of the base, which is generous for parsing and cheap to be wrong
+    // about — the timeout only ever ends a wait that was going to fail.
+    const pieces = pieceCountOf(this.#torrentId);
+    const timeoutMs = (this.#options.readyTimeoutMs ?? 60000) + pieces;
     const torrent = await new Promise<WtTorrent>((resolve, reject) => {
       let settled = false;
       const finish = (fn: () => void) => {

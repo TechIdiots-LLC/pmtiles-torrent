@@ -7,6 +7,27 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.10.0
+### ✨ Features and improvements
+- **A large torrent can be joined from a browser.** Bringing one up costs time before it costs
+  bandwidth: WebTorrent walks every piece before `ready` fires, so a fixed metadata budget quietly
+  excluded the archives most worth sharing. Measured against a live swarm, a 749 GiB build is 178,690
+  pieces where an 80 GiB one is 20,636 — the same 30-second budget joined the second and timed out on
+  the first, which then fell back to plain HTTP.
+
+  - **No verify pass without a store.** `path` unset means nothing is persisted, so a verify can find
+    nothing — and it is not free, being the whole budget spent proving an empty store is empty.
+    `skipVerify` is now set in that case. A node that keeps a store verifies as before, since there
+    it has something worth checking.
+  - **The budget grows with the torrent.** `readyTimeoutMs` gains a millisecond per piece where the
+    metainfo was supplied outright and the count can be read from it. A magnet carries no piece
+    count, so it keeps the base budget.
+
+  Neither refuses to join a large archive on the grounds of size. A big archive is exactly the one
+  where seeding is worth having.
+
+### 🐞 Bug fixes
+
 ## 0.9.1
 ### ✨ Features and improvements
 
