@@ -7,6 +7,18 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.10.1
+### 🐞 Bug fixes
+- **0.10.0's `skipVerify` broke every read from a browser.** It reads like "do not waste time
+  checking a store that is empty anyway" and means the opposite: WebTorrent's own `seed()` sets it to
+  declare the data already complete. On a store holding nothing the torrent claimed all 178,690
+  pieces, never downloaded one, and the first read failed inside the store with `Index 0 does not
+  exist`. Removed, with the reasoning written down where the next person will look for it.
+
+  The verify pass is what leaves the bitfield honest, and an honest bitfield is what makes the first
+  read fetch a piece rather than look for one. The scaled `readyTimeoutMs` from 0.10.0 is what makes
+  a large torrent joinable, and stands.
+
 ## 0.10.0
 ### ✨ Features and improvements
 - **A large torrent can be joined from a browser.** Bringing one up costs time before it costs

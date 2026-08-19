@@ -33,11 +33,12 @@ function recordingClient() {
 }
 
 describe("adding a torrent from a browser", () => {
-  it("skips the verify pass when nothing is persisted", async () => {
-    // There is no store to check, so a verify pass can find nothing — and it
-    // is not free: WebTorrent walks every piece before `ready` fires, which on
-    // a large archive is the entire metadata budget spent proving that an
-    // empty store is empty.
+  it("never claims to hold data it does not have", async () => {
+    // `skipVerify` reads like "do not waste time checking an empty store" and
+    // means the opposite: WebTorrent's own seed() sets it to declare the data
+    // complete. On a store holding nothing the torrent then claims every
+    // piece, never downloads one, and the first read fails inside the store
+    // with "Index 0 does not exist" — which is what a browser did with it.
     const { client, seen } = recordingClient();
     const engine = new WebTorrentEngine(metainfo(4), {
       client,
@@ -46,13 +47,11 @@ describe("adding a torrent from a browser", () => {
     await engine.ready().catch(() => {});
 
     assert.equal(seen.length, 1);
-    assert.equal(seen[0].options.skipVerify, true);
+    assert.equal(seen[0].options.skipVerify, undefined);
     assert.equal(seen[0].options.deselect, true);
   });
 
-  it("keeps the verify pass where there is a store to verify", async () => {
-    // A node holding the archive on disk has something worth checking, and
-    // skipping it would mean seeding pieces nothing had confirmed.
+  it("says the same with a store on disk", async () => {
     const { client, seen } = recordingClient();
     const engine = new WebTorrentEngine(metainfo(4), {
       client,

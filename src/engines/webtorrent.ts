@@ -523,13 +523,11 @@ export class WebTorrentEngine implements TorrentEngine {
       deselect: true,
     };
     if (this.#options.path) addOptions.path = this.#options.path;
-    else {
-      // Nothing is persisted, so there is nothing a verify pass could find.
-      // It is not free either: WebTorrent walks every piece before `ready`
-      // fires, which on a 178,000-piece archive is what a browser spends its
-      // whole metadata budget on. See the README — "In a browser".
-      addOptions.skipVerify = true;
-    }
+    // Deliberately no `skipVerify`. It reads like "do not waste time checking
+    // an empty store" and means the opposite: WebTorrent's own `seed()` sets
+    // it to say the data is already complete, so on a store holding nothing
+    // the torrent claims every piece and the first read fails with "Index 0
+    // does not exist". Same trap as libtorrent's seed_mode.
     if (this.#options.announce) addOptions.announce = this.#options.announce;
     // If the torrent carries a BEP 19 url-list, that HTTP origin is usually
     // faster and far more available than the swarm — measured serving a tile in

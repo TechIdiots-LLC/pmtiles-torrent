@@ -323,18 +323,19 @@ case for it is bandwidth rather than latency: every piece a viewer pulls is one 
 **Bringing a large torrent up costs time before it costs bandwidth.** WebTorrent walks every piece
 before `ready` fires, so a fixed metadata budget quietly excludes the archives most worth sharing:
 a 749 GiB build is 178,690 pieces against 20,636 for an 80 GiB one, and the same 30-second budget
-joined the second and timed out on the first. Two things follow, and both are automatic:
+joined the second and timed out on the first. So `readyTimeoutMs` gains a millisecond per piece
+wherever the metainfo was supplied outright and the count can be read from it. A magnet carries no
+piece count, so it keeps the base budget.
 
-- **No verify pass without a store.** `path` unset means nothing is persisted, so there is nothing a
-  verify could find — but it is not free, and on a large archive it is the whole budget spent
-  proving an empty store is empty. `skipVerify` is set for you; a node that does keep a store
-  verifies as before, because there it has something worth checking.
-- **The budget grows with the torrent.** `readyTimeoutMs` gains a millisecond per piece where the
-  metainfo was supplied outright, which is the case that can be measured. A magnet carries no piece
-  count, so it gets the base budget.
+It does not refuse to join a large archive for being large. That is exactly the one where seeding is
+worth having.
 
-Neither refuses to join a large archive. A big archive is exactly the one where seeding is worth
-having, and a client that gives up on it because it is big would leave the whole point behind.
+**Do not reach for `skipVerify` to make this faster.** It reads like "skip checking a store that is
+empty anyway" and means the opposite: WebTorrent's own `seed()` sets it to declare the data already
+complete. On a browser store holding nothing, the torrent then claims every piece, never downloads
+one, and the first read fails inside the store with `Index 0 does not exist`. The verify pass is
+what leaves the bitfield honest, and an honest bitfield is what makes the first read fetch the piece
+rather than look for it.
 ## Development
 
 TypeScript source in `src/`, compiled by tsup to ESM, CJS and declarations in `dist/`. Consumers
