@@ -1666,20 +1666,46 @@ class Sidecar:
         with self._subscribe(wanted, capture) as subscription:
             saved = 0
             for handle in handles:
-                # Asked unconditionally.
+                # Asked unconditionally the first time, and only when something
+                # has changed after that.
                 #
-                # This used to ask need_save_resume_data() first, which reports
-                # whether anything has changed since the last save — not whether
-                # a resume file exists. A torrent that has sat there seeding
-                # since it was added answers "nothing has changed", so nothing
-                # was ever written for it, and it re-hashed its whole store on
-                # every start. The saving is a few kilobytes; the checking is
-                # half an hour.
+                # need_save_resume_data() reports whether anything has changed
+                # since the last save -- not whether a resume file exists. A
+                # torrent that has sat seeding since it was added answers
+                # "nothing has changed", so honouring it on its own meant
+                # nothing was ever written and the archive re-hashed its whole
+                # store on every start.
+                #
+                # Asking unconditionally fixed that and brought its own cost. A
+                # hybrid torrent's resume data carries a merkle tree of 32 bytes
+                # per 16 KiB block -- a few hundred megabytes for a 128 GiB
+                # archive, several gigabytes for a planet build -- and this runs
+                # every five minutes. Staged, fsynced and renamed each time, for
+                # every torrent at once, to record that nothing had moved.
+                #
+                # Both properties hold if the file's existence is what decides
+                # rather than the flag alone: the first save always happens, and
+                # the rewrites stop.
+                if self._has_resume(_v1_of(handle)):
+                    try:
+                        if not handle.need_save_resume_data():
+                            continue
+                    except Exception:  # pragma: no cover - libtorrent's surface
+                        # A handle that cannot answer is one worth saving.
+                        pass
                 handle.save_resume_data()
                 saved += 1
 
             written = 0
-            deadline = time.time() + 5
+            # Two seconds per torrent, not five for the library. It was a
+            # fixed total shared by everything: whichever alerts arrived inside
+            # it were written and the rest were silently dropped, so a node
+            # with four archives persisted two of them and a different two next
+            # time. What that costs is a full re-hash of the ones that missed,
+            # every start, for as long as they keep missing -- and the count
+            # was returned but never looked at, so nothing said so.
+            asked = saved
+            deadline = time.time() + max(5.0, 2.0 * asked)
             while saved > 0 and time.time() < deadline:
                 try:
                     item = subscription.queue.get(timeout=deadline - time.time())
@@ -1694,7 +1720,7 @@ class Sidecar:
                 self._write_resume(info_hash, buffer)
                 written += 1
 
-        return {"saved": True, "written": written}
+        return {"saved": True, "written": written, "asked": asked}
 
     def op_shutdown(self, _params):
         """Persist resume data and stop."""
@@ -1817,6 +1843,18 @@ class Sidecar:
             return None
         with open(path, "rb") as handle:
             return handle.read()
+
+    def _has_resume(self, info_hash):
+        """Whether anything has ever been written down for this torrent.
+
+        The question `need_save_resume_data` does not answer: it reports change
+        since the last save, and a torrent that has never been saved at all has
+        nothing to have changed since.
+        @param info_hash: The torrent to look for.
+        @return: True when a resume file is on disk.
+        """
+        path = self._resume_path(info_hash)
+        return bool(path) and os.path.exists(path)
 
     def _discard_resume(self, info_hash):
         """Throws away a resume file the torrent it names cannot use.

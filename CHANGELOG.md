@@ -7,6 +7,27 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.9.1
+### ✨ Features and improvements
+
+### 🐞 Bug fixes
+- **Resume data that has not changed is no longer rewritten.** A hybrid torrent carries a merkle tree
+  of 32 bytes per 16 KiB block in its resume data — a few hundred megabytes for a 128 GiB archive,
+  several gigabytes for a planet build — and the periodic save asked every torrent unconditionally,
+  every five minutes, staging and fsyncing and renaming the lot to record that nothing had moved.
+
+  Asking unconditionally was itself a fix: `need_save_resume_data()` reports change since the last
+  save, not whether a file exists, so a torrent that had sat seeding since it was added answered
+  "nothing has changed" and nothing was ever written for it — and it re-hashed its whole store on
+  every start. Both properties hold if the file's existence decides rather than the flag alone. The
+  first save always happens; the rewrites stop.
+- **`save_resume` now gives each torrent its own share of the budget.** Five seconds was a fixed
+  total for the whole library: whichever alerts arrived inside it were written and the rest were
+  silently dropped, so a node with four archives persisted two of them, and a different two next
+  time. Each one that missed re-hashed its entire store on the following start. It is two seconds per
+  torrent now, and the reply carries `asked` alongside `written` so a caller can see the shortfall
+  rather than infer it.
+
 ## 0.9.0
 ### ✨ Features and improvements
 - **`pause` and `resume`, which did not exist.** A consumer had no way to stop a torrent short of
