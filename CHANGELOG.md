@@ -7,6 +7,34 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.10.2
+### 🐞 Bug fixes
+- **A seed_mode claim no longer loses to the resume data beside it, which is what made a
+  library re-check itself for ever.** libtorrent drops `seed_mode` outright if the resume data
+  holds a single unset piece (`torrent.cpp:408`), and resume data written while a check was
+  running holds exactly that — `write_resume_data` truncates `have_pieces` to
+  `m_num_checked_pieces` so the check can carry on where it stopped. Both behaviours are
+  deliberate, and together they say opposite things: "I have all of this" against "I had
+  verified this far".
+
+  libtorrent believes the bitfield, so the archive comes back as a downloader with every byte
+  already on disk, checks again, and writes another truncated bitfield for the next start.
+  Nothing restarts the loop and nothing ends it. Measured on a 698 GiB archive: seventeen
+  hours of hashing to rediscover what the claim asserts in seconds, and the same again after
+  the next restart.
+
+  An add that asks for `seedOnly` now discards a bitfield that would cancel it, and **only**
+  the bitfield — the counters, the peer list and the trackers in that file are all still
+  wanted, and throwing the whole file away to win the argument would reset every archive's
+  ratio on every start.
+
+- **The periodic save skips a torrent that is hashing its store.** It has nothing worth
+  writing down: the file already on disk, written when the archive was whole, describes it
+  better than a check in progress can, and writing one is what manufactured the poison above.
+  Only `checking_files`. A paused torrent rests in `checking_resume_data`, and that state
+  truncates nothing — skipping it too would mean a paused archive never had its resume data
+  saved at all.
+
 ## 0.10.1
 ### 🐞 Bug fixes
 - **0.10.0's `skipVerify` broke every read from a browser.** It reads like "do not waste time

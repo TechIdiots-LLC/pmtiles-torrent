@@ -864,6 +864,44 @@ class Sidecar:
         # before sending it if a peer's request fails, so a claim that turns
         # out to be wrong costs a re-check rather than bad data.
         if params.get("seedOnly"):
+            # A bitfield that disagrees loses the whole claim, silently.
+            #
+            # libtorrent drops seed_mode outright if the resume data holds a
+            # single unset piece (torrent.cpp:408) -- and resume data written
+            # while a check was running holds exactly that, because
+            # write_resume_data truncates have_pieces to m_num_checked_pieces
+            # so the check can carry on where it stopped. Both behaviours are
+            # deliberate and they contradict each other: "I have all of this"
+            # against "I had verified this far".
+            #
+            # libtorrent resolves it by believing the bitfield, so the archive
+            # returns as a downloader with every byte already on disk, checks
+            # again, and writes another truncated bitfield for the next start.
+            # Measured on a 698 GiB archive: seventeen hours of hashing to
+            # rediscover what seed_mode would have asserted in seconds, and
+            # then the same again after the next restart.
+            #
+            # Only the bitfield goes. The counters, the peer list and the
+            # trackers in that file are all still wanted -- discarding the
+            # whole thing to win this argument would reset every archive's
+            # ratio on every start.
+            if used_resume:
+                held = [bool(bit) for bit in (getattr(atp, "have_pieces", None) or [])]
+                if any(bit is False for bit in held):
+                    self._say_once(
+                        f"resume data for {wanted_hash} records "
+                        f"{sum(held)}/{len(held)} pieces, which would cancel "
+                        "the seed_mode claim; keeping the rest of the file and "
+                        "discarding the piece bitfield"
+                    )
+                    atp.have_pieces = []
+                    # Never consulted while seed_mode holds -- on_resume_data_checked
+                    # reads these only on the branch seed_mode does not take -- but
+                    # left behind they would describe a torrent this no longer is.
+                    try:
+                        atp.unfinished_pieces = {}
+                    except Exception:  # noqa: BLE001 - not settable on every build
+                        pass
             atp.flags |= lt.torrent_flags.seed_mode
 
         if params.get("paused"):
@@ -1666,6 +1704,24 @@ class Sidecar:
         with self._subscribe(wanted, capture) as subscription:
             saved = 0
             for handle in handles:
+                # A torrent that is checking has nothing worth writing down.
+                #
+                # write_resume_data truncates have_pieces to
+                # m_num_checked_pieces while the state is checking_files, so a
+                # save taken here records how far the check got rather than
+                # what the archive holds. That shortened bitfield is what
+                # cancels a seed_mode claim on the next start, so writing one
+                # turns this check into the next one -- and the file already on
+                # disk, written when the archive was whole, describes it better
+                # than a check in progress ever can.
+                #
+                # Only checking_files. A paused torrent rests in
+                # checking_resume_data, and that state truncates nothing:
+                # is_checking is false there and m_files_checked is not yet
+                # set, so libtorrent writes no bitfield at all.
+                if self._is_checking_files(handle):
+                    continue
+
                 # Asked unconditionally the first time, and only when something
                 # has changed after that.
                 #
@@ -1843,6 +1899,24 @@ class Sidecar:
             return None
         with open(path, "rb") as handle:
             return handle.read()
+
+    def _is_checking_files(self, handle):
+        """Whether this torrent is actually hashing its store right now.
+
+        Asked of the handle rather than the status cache, which cannot answer
+        it: the cache renders both checking_files and checking_resume_data as
+        the string "checking", and only the first of the two truncates a
+        bitfield. This runs once per torrent per save interval, so the round
+        trip to the session thread costs nothing worth optimising away.
+        @param handle: The torrent.
+        @return: True while the store is being hashed.
+        """
+        if CHECKING_FILES is None:
+            return False
+        try:
+            return handle.status().state == CHECKING_FILES
+        except Exception:  # noqa: BLE001 - a handle that cannot answer is not checking
+            return False
 
     def _has_resume(self, info_hash):
         """Whether anything has ever been written down for this torrent.
